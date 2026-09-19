@@ -91,4 +91,8 @@ Chrome 调试端口仅绑定本机，但本机其他进程仍可连接并控制�
 1. 改 `Cargo.toml` 的 `version`，在 CHANGELOG.md 最上面写 `## X.Y.Z - 日期` 一节，这一节会原样当作发布说明。
 2. 本机跑 `cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test`（CI 不跑 fmt 和 clippy：它的 Rust 版本更新后，新加的 lint 会卡住发版）。
 3. 提交，打标签并推送：`git tag -a vX.Y.Z -m "webctl X.Y.Z"`，`git push origin main vX.Y.Z`。
-4. GitHub Actions（`.github/workflows/release.yml`）在 Windows 上核对标签和 `Cargo.toml` 版本一致、跑 `cargo test`、编译，把 `webctl.exe` 连同 SKILL.md、README.md、CHANGELOG.md 打成 `webctl-windows-x86_64.zip` 发到 Releases。测试不过就不发。
+4. GitHub Actions（`.github/workflows/release.yml`）在 Windows 上核对标签和 `Cargo.toml` 版本一致、跑 `cargo test`、编译，把 `webctl.exe` 连同 SKILL.md、README.md、CHANGELOG.md、LICENSE 打成 `webctl-windows-x86_64.zip` 发到 Releases。测试不过就不发。
+
+## 许可
+
+MIT，见 [LICENSE](LICENSE)。

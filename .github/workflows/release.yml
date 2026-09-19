@@ -1,4 +1,4 @@
-# 推 v* 标签时：跑测试、编译 Windows 版，把 webctl.exe 连同 SKILL.md 打包发到 GitHub Releases，
+# 推 v* 标签时：跑测试、编译 Windows 版，把 webctl.exe 连同 SKILL.md、LICENSE 打包发到 GitHub Releases，
 # 发布说明取 CHANGELOG.md 里这个版本的一节。fmt、clippy 发版前在本机跑（CI 的 Rust 版本更新时新 lint 会卡住发版）。
 # ponytail: 只出 Windows x86_64，用 webctl 的机器都是 Windows；要别的平台再加 matrix
 name: release
@@ -35,6 +35,6 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           awk -v v="$version" '/^## /{p = index($0, "## " v " ") == 1; next} p' CHANGELOG.md > notes.md
           [ -s notes.md ] || { echo "CHANGELOG.md 里没有 $version 这一节"; exit 1; }
-          mkdir webctl && cp target/release/webctl.exe SKILL.md README.md CHANGELOG.md webctl/
+          mkdir webctl && cp target/release/webctl.exe SKILL.md README.md CHANGELOG.md LICENSE webctl/
           7z a webctl-windows-x86_64.zip webctl
           gh release create "$GITHUB_REF_NAME" webctl-windows-x86_64.zip --title "webctl $version" --notes-file notes.md
