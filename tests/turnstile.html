@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>turnstile fixture</title>
+  <!-- 内嵌在表单里的控件：验证通过后页面不跳转、控件也不消失，只是把 token 写进隐藏字段。
+       通过与否只能看 token，看"标记还在不在"会一律误判成没过 -->
+  <style>
+    body { margin: 0; }
+    #wrap { padding: 40px; }
+    iframe { width: 300px; height: 65px; border: 1px solid #ccc; display: block; }
+  </style>
+</head>
+<body>
+  <form id="login">
+    <div id="wrap"><iframe id="widget" src="./challenges.cloudflare.com.html"></iframe></div>
+    <input type="hidden" name="cf-turnstile-response" value="">
+  </form>
+  <script>
+    addEventListener('message', event => {
+      if (event.data !== 'turnstile-clicked') return;
+      document.querySelector('[name="cf-turnstile-response"]').value = 'XXXX.DUMMY.TOKEN.XXXX';
+      document.title = 'turnstile passed';
+    });
+  </script>
+</body>
+</html>

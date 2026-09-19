@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>turnstile managed fixture</title>
+  <!-- 整页验证的结构：主文档里只有一个 0×0 的隐藏字段 cf-chl-widget-xxx_response，
+       它的父元素（随机 id）挂着封闭 shadow root，勾选框 iframe 在里面，而且 4 秒后才插进去。
+       标题故意不用 "Just a moment..."：判断"已通过"如果只看标题和主文档选择器，还没点就会报通过 -->
+  <style>
+    body { margin: 0; }
+    #wrap { padding: 40px; }
+  </style>
+</head>
+<body>
+  <div id="wrap">
+    <div id="q7Rk2"><input type="hidden" name="cf-turnstile-response" id="cf-chl-widget-abc_response"></div>
+  </div>
+  <script>
+    const host = document.getElementById('q7Rk2');
+    const root = host.attachShadow({ mode: 'closed' });
+    setTimeout(() => {
+      root.innerHTML =
+        '<iframe src="./challenges.cloudflare.com.html" style="width:300px;height:65px;border:0"></iframe>';
+    }, 4000);
+    addEventListener('message', event => {
+      if (event.data !== 'turnstile-clicked') return;
+      // 相当于验证通过后跳走：控件和隐藏字段一起消失
+      host.remove();
+      document.title = 'turnstile passed';
+    });
+  </script>
+</body>
+</html>

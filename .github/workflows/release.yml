@@ -1,0 +1,40 @@
+# 推 v* 标签时：跑测试、编译 Windows 版，把 webctl.exe 连同 SKILL.md 打包发到 GitHub Releases，
+# 发布说明取 CHANGELOG.md 里这个版本的一节。fmt、clippy 发版前在本机跑（CI 的 Rust 版本更新时新 lint 会卡住发版）。
+# ponytail: 只出 Windows x86_64，用 webctl 的机器都是 Windows；要别的平台再加 matrix
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 标签和 Cargo.toml 版本一致
+        shell: bash
+        run: grep -q "^version = \"${GITHUB_REF_NAME#v}\"" Cargo.toml || { echo "标签 $GITHUB_REF_NAME 和 Cargo.toml 的 version 不一致"; exit 1; }
+
+      # smoke 测试用无头 Chrome，runner 上装了 Chrome
+      - name: 测试
+        run: cargo test --locked
+
+      - name: 编译
+        run: cargo build --release --locked
+
+      - name: 打包并发布
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '/^## /{p = index($0, "## " v " ") == 1; next} p' CHANGELOG.md > notes.md
+          [ -s notes.md ] || { echo "CHANGELOG.md 里没有 $version 这一节"; exit 1; }
+          mkdir webctl && cp target/release/webctl.exe SKILL.md README.md CHANGELOG.md webctl/
+          7z a webctl-windows-x86_64.zip webctl
+          gh release create "$GITHUB_REF_NAME" webctl-windows-x86_64.zip --title "webctl $version" --notes-file notes.md

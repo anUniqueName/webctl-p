@@ -1,0 +1,12 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>example.com</title>
+</head>
+<body>
+  <!-- DataDome 拦截页的识别特征：iframe 的 src 含 captcha-delivery.com。
+       识别只看 src 属性，指向的文件不存在也没关系，测试不访问外网 -->
+  <iframe src="./captcha-delivery.com.html" width="400" height="300"></iframe>
+</body>
+</html>

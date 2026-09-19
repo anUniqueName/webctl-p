@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>challenge widget</title>
+  <!-- 文件名带 challenges.cloudflare.com，是为了让生产代码里那个选择器原样命中本地文件，
+       不必为测试在 src 里开后门 -->
+  <style>
+    html, body { margin: 0; height: 100%; font: 12px system-ui; }
+    #box { position: absolute; left: 0; top: 0; width: 60px; height: 100%; background: #ddd; }
+  </style>
+</head>
+<body>
+  <div id="box"></div>
+  <span style="margin-left:70px">Verify you are human</span>
+  <script>
+    // 只认浏览器发出的真实鼠标事件；JS 合成的点击不算数
+    document.getElementById('box').addEventListener('click', event => {
+      if (event.isTrusted) parent.postMessage('turnstile-clicked', '*');
+    });
+  </script>
+</body>
+</html>

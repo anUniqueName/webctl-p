@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>turnstile shadow fixture</title>
+  <!-- 复刻真实 Turnstile 的结构：勾选框在容器的封闭 shadow root 里，JS 够不着，
+       只能靠容器自己的矩形算坐标，再用真实鼠标事件点进去 -->
+  <style>
+    body { margin: 0; }
+    #wrap { padding: 40px; }
+    .cf-turnstile { display: block; width: 300px; height: 71px; }
+  </style>
+</head>
+<body>
+  <div id="wrap"><div id="widget" class="cf-turnstile"></div></div>
+  <script>
+    const host = document.getElementById('widget');
+    const root = host.attachShadow({ mode: 'closed' });
+    root.innerHTML =
+      '<iframe src="./challenges.cloudflare.com.html" style="width:300px;height:71px;border:0"></iframe>';
+    addEventListener('message', event => {
+      if (event.data !== 'turnstile-clicked') return;
+      host.remove();
+      document.title = 'turnstile passed';
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>webctl smoke fixture</title>
+  <style>
+    body { font: 16px sans-serif; padding: 24px; }
+    .blocked-wrap { position: relative; display: inline-block; }
+    .mask { position: absolute; inset: 0; z-index: 2; background: rgba(0,0,0,.2); }
+    #toast { position: fixed; top: 8px; right: 8px; background: #222; color: white; padding: 8px; }
+    /* 标题文字盖住 checkbox：ant-design 一类选项行的常见写法 */
+    .export-option { position: relative; display: inline-block; padding: 4px 8px; }
+    .export-option__title { position: absolute; inset: 0; background: #eee; }
+    iframe { display: block; width: 320px; height: 80px; margin-top: 12px; }
+    #track { position: relative; width: 300px; height: 32px; margin-top: 12px; background: #ddd; }
+    #knob { position: absolute; left: 0; top: 0; width: 40px; height: 32px; background: #4a7; }
+  </style>
+</head>
+<body>
+  <!-- text= 定位：被遮罩盖住的同名按钮不算；文字拆在子元素里也认；同名的两个都能点时报错 -->
+  <div>
+    <div class="blocked-wrap"><button onclick="textResult('背后的确定')">确定</button><div class="mask"></div></div>
+    <button onclick="textResult('前面的确定')">确定</button>
+    <button onclick="textResult('分段文字')"><b>新增</b>物流渠道</button>
+    <button>编辑</button><button>编辑</button>
+    <span id="text-result"></span>
+  </div>
+  <label for="name">姓名</label><input id="name" placeholder="请输入姓名">
+  <button id="flash">保存</button>
+  <a id="new-tab" href="about:blank#child" target="_blank">打开新标签</a>
+  <select id="country">
+    <option value="US">United States</option>
+    <option value="DE">Germany</option>
+  </select>
+  <input id="file" type="file"><span id="file-result"></span>
+  <button id="confirm">确认弹窗</button><span id="confirm-result"></span>
+  <div class="blocked-wrap"><button id="blocked">被挡按钮</button><div class="mask"></div></div>
+  <label class="export-option"><input id="opt" type="checkbox"><div class="export-option__title">可售天数显示</div></label>
+  <div class="blocked-wrap"><button id="fading">淡出后可点</button><div class="mask" id="fading-mask"></div></div>
+  <p id="iframe-result"></p>
+  <iframe title="同源框架" srcdoc="<button id='inside' onclick=&quot;parent.document.getElementById('iframe-result').textContent='iframe 已点击'&quot;>iframe按钮</button>"></iframe>
+  <!-- 选择器命中多个时先取可见的：第一个同名输入框是隐藏的；只有隐藏的 file 输入框时照样能 upload -->
+  <input name="dup" style="display:none"><input name="dup" id="dup2">
+  <input id="hidden-file" type="file" style="display:none">
+  <!-- fill 报错要写明实际原因：焦点被页面转走、输入框已禁用 -->
+  <input id="redir" onfocus="document.getElementById('real').focus()"><input id="real"><input id="off" disabled>
+  <!-- 拦截页的脚本会改写 DOM 属性：一个元素的 tagName 是 undefined，另一个一读 localName 就抛错 -->
+  <span id="odd-tag" style="cursor:pointer">改过标签名</span>
+  <span id="broken" style="cursor:pointer">读取出错的元素</span>
+  <!-- clickat --hold 和 drag：按住不少于 1500ms 才算完成的按钮；按住左键拖到最右才算完成的滑块。
+       记下收到的鼠标事件里有没有 isTrusted 为 false 的 -->
+  <button id="hold">按住按钮</button>
+  <div id="track"><div id="knob"></div></div>
+  <!-- 正常页面里预先放好、平时隐藏的滑块验证容器：没渲染出来的不算拼图验证页 -->
+  <div id="nc-captcha-wrap" style="display:none">请按住滑块，拖动到最右边</div>
+  <script>
+    window.inputLog = {hold: '', slider: '', untrusted: 0, dragMoves: 0};
+    const trusted = event => { if (!event.isTrusted) inputLog.untrusted++; };
+    let pressedAt = 0;
+    const holdButton = document.querySelector('#hold');
+    holdButton.addEventListener('mousedown', event => { trusted(event); pressedAt = performance.now(); });
+    holdButton.addEventListener('mouseup', event => {
+      trusted(event);
+      if (pressedAt && performance.now() - pressedAt >= 1500) inputLog.hold = '按住完成';
+      pressedAt = 0;
+    });
+    const track = document.querySelector('#track'), knob = document.querySelector('#knob');
+    let grab = null; // 按下时鼠标离滑块左边多远
+    knob.addEventListener('mousedown', event => { trusted(event); grab = event.clientX - knob.getBoundingClientRect().left; });
+    document.addEventListener('mousemove', event => {
+      // 只认按着左键的移动
+      if (grab === null || event.buttons !== 1) return;
+      trusted(event);
+      inputLog.dragMoves++;
+      const max = track.clientWidth - knob.offsetWidth;
+      knob.style.left = Math.max(0, Math.min(max, event.clientX - track.getBoundingClientRect().left - grab)) + 'px';
+    });
+    document.addEventListener('mouseup', event => {
+      if (grab === null) return;
+      trusted(event);
+      grab = null;
+      if (parseFloat(knob.style.left) >= track.clientWidth - knob.offsetWidth - 1) inputLog.slider = '拖动完成';
+    });
+  </script>
+  <script>
+    // 页面自己的全局变量：eval 里 const 同名也要能用
+    var webctlPageVar = 1;
+    Object.defineProperty(document.querySelector('#odd-tag'), 'tagName', {get: () => undefined});
+    Object.defineProperty(document.querySelector('#broken'), 'localName', {get() { throw new Error('页面改坏的属性'); }});
+    const textResult = text => { document.querySelector('#text-result').textContent = text; };
+    document.querySelector('#flash').onclick = () => {
+      const toast = document.createElement('div');
+      toast.id = 'toast'; toast.textContent = '保存成功'; document.body.appendChild(toast);
+      setTimeout(() => toast.remove(), 1000);
+    };
+    document.querySelector('#confirm').onclick = () => {
+      document.querySelector('#confirm-result').textContent = confirm('确定继续吗？') ? '已确认' : '已取消';
+    };
+    document.querySelector('#file').onchange = event => {
+      document.querySelector('#file-result').textContent = event.target.files[0]?.name || '';
+    };
+  </script>
+</body>
+</html>
