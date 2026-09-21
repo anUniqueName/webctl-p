@@ -368,8 +368,9 @@ pub fn find_image(browser: &mut Browser, path: &Path, threshold: f64, max: usize
     let (page, scale_x, scale_y) = capture_gray(browser, &session)?;
     let template_bytes =
         fs::read(path).with_context(|| format!("无法读取模板图片 {}", path.display()))?;
-    let template = vision::decode_png(&template_bytes)
-        .with_context(|| format!("模板图片 {} 不是有效的 PNG", path.display()))?;
+    let template = vision::decode_image(&template_bytes)
+        .with_context(|| format!("模板图片 {} 无法解码（支持 PNG/JPEG/WebP）", path.display()))?
+        .gray;
     let found = vision::find(&page, &template, threshold, max);
     let matches: Vec<Value> = found
         .iter()
@@ -393,6 +394,59 @@ pub fn find_image(browser: &mut Browser, path: &Path, threshold: f64, max: usize
     if found.is_empty() {
         output["hint"] =
             json!("没有找到匹配：确认模板是从当前页面同一缩放比例下截的图，或降低 --threshold");
+    }
+    Ok(output)
+}
+
+/// 纯本地的缺口识别：不需要浏览器。背景图、滑块图都是文件，支持 PNG/JPEG/WebP。
+pub fn gap_files(bg_path: &Path, piece_path: Option<&Path>, max: usize) -> Result<Value> {
+    let bg_bytes =
+        fs::read(bg_path).with_context(|| format!("无法读取背景图 {}", bg_path.display()))?;
+    let bg = vision::decode_image(&bg_bytes)
+        .with_context(|| format!("背景图 {} 无法解码（支持 PNG/JPEG/WebP）", bg_path.display()))?;
+    let piece = match piece_path {
+        Some(p) => {
+            let bytes = fs::read(p).with_context(|| format!("无法读取滑块图 {}", p.display()))?;
+            Some(
+                vision::decode_image(&bytes)
+                    .with_context(|| format!("滑块图 {} 无法解码（支持 PNG/JPEG/WebP）", p.display()))?,
+            )
+        }
+        None => None,
+    };
+    let gaps = vision::find_gap(&bg.gray, piece.as_ref(), max);
+    let candidates: Vec<Value> = gaps
+        .iter()
+        .map(|g| {
+            json!({
+                "x": g.x,
+                "y": g.y,
+                "w": g.w,
+                "h": g.h,
+                "cx": g.x + g.w / 2,
+                "cy": g.y + g.h / 2,
+                "score": (g.score * 100.0).round() / 100.0,
+                "iou": (g.iou * 1000.0).round() / 1000.0,
+                "stability": g.stability,
+                "darkness": (g.darkness * 10.0).round() / 10.0
+            })
+        })
+        .collect();
+    let mut output = json!({
+        "ok": true,
+        "bg": bg_path.display().to_string(),
+        "piece": piece_path.map(|p| p.display().to_string()),
+        "width": bg.gray.width,
+        "height": bg.gray.height,
+        "candidates": candidates
+    });
+    if piece.as_ref().is_some_and(|p| p.alpha.is_none()) {
+        output["note"] =
+            json!("滑块图没有透明通道，形状打分（iou）未生效；用带 alpha 的 PNG/WebP 滑块图效果最好");
+    }
+    if gaps.is_empty() {
+        output["hint"] =
+            json!("没有找到缺口：确认背景图是没缩放的原始图；给了 --piece 时滑块图要和背景图同一比例");
     }
     Ok(output)
 }
@@ -489,8 +543,9 @@ pub fn vclick(
     let (page, scale_x, scale_y) = capture_gray(browser, &session)?;
     let template_bytes =
         fs::read(path).with_context(|| format!("无法读取模板图片 {}", path.display()))?;
-    let template = vision::decode_png(&template_bytes)
-        .with_context(|| format!("模板图片 {} 不是有效的 PNG", path.display()))?;
+    let template = vision::decode_image(&template_bytes)
+        .with_context(|| format!("模板图片 {} 无法解码（支持 PNG/JPEG/WebP）", path.display()))?
+        .gray;
     let found = vision::find(&page, &template, threshold, 1);
     let Some(best) = found.first() else {
         return Ok(json!({

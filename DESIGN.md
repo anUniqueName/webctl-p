@@ -28,7 +28,7 @@
 ## 技术选型
 
 - Rust 2024 edition，同步代码，不用 tokio。
-- 只用 Cargo.toml 里已有的依赖：`tungstenite`（WebSocket，只连本机 `ws://`，不需要 TLS）、`serde`/`serde_json`、`clap`（derive）、`anyhow`、`base64`、`png`（`find`、`vclick` 解码截图和模板图）、`rusqlite`（命令日志；`screenshot` 输出的本地时间也借它算）。不为单个功能新增依赖。
+- 只用 Cargo.toml 里已有的依赖：`tungstenite`（WebSocket，只连本机 `ws://`，不需要 TLS）、`serde`/`serde_json`、`clap`（derive）、`anyhow`、`base64`、`png`（`find`、`vclick` 解码截图和模板图）、`image`（只开 `jpeg`/`webp` 两个解码 feature，`gap` 的输入和 `find`/`vclick` 的模板图要认 JPEG/WebP）、`rusqlite`（命令日志；`screenshot` 输出的本地时间也借它算）。不为单个功能新增依赖——`image` 是 0.5.0 缺口识别和模板图格式扩展的共同需要，是唯一例外。
 - 访问 `/json/version` 用 `std::net::TcpStream` 手写 HTTP/1.1 GET（带 `Connection: close`）。Chrome 调试端口不接受 HTTP/1.0，收到后直接断开连接；它的响应很简单，带 Content-Length。
 
 ## 文件布局

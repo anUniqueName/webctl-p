@@ -30,12 +30,13 @@ cargo install --path .
 - `upload TARGET FILE...`：设置文件输入框。
 - `scroll up|down|top|bottom [PX]`：滚动页面或元素。
 - `eval JS` / `eval --file PATH` `[--max N]`：执行 JavaScript。按控制台模式执行：同一页面上多次 eval 可以重复声明同名 `const`/`let`，顶层 `await` 直接返回结果。多行脚本、含 `$` 或 `\` 的脚本写进文件用 `--file`；结果超过 `--max`（默认 20000 字）截成字符串，输出带 `truncated`、`length`。
-- `screenshot [PATH] [--full] [--annotate]`：保存截图。路径以 `.jpg`/`.jpeg` 结尾时存成 JPEG（质量 80），否则 PNG；`find`/`vclick` 的模板请用 PNG 截图裁。输出含截图时页面的 `url`、`title`、`taken_at`（本地时间）；文件已存在时照样覆盖，输出 `"overwrote": true`。
-- `find IMAGE [--threshold 0.8] [--max N]`：视觉识别——在当前页面截图里找模板图片，返回匹配中心的视口坐标与相似度。
+- `screenshot [PATH] [--full] [--annotate]`：保存截图。路径以 `.jpg`/`.jpeg` 结尾时存成 JPEG（质量 80），否则 PNG；`find`/`vclick`/`gap` 的图片支持 PNG/JPEG/WebP。输出含截图时页面的 `url`、`title`、`taken_at`（本地时间）；文件已存在时照样覆盖，输出 `"overwrote": true`。
+- `find IMAGE [--threshold 0.8] [--max N]`：视觉识别——在当前页面截图里找模板图片（PNG/JPEG/WebP），返回匹配中心的视口坐标与相似度。
 - `move X Y`：以拟人轨迹（贝塞尔曲线、先慢后快再慢）把鼠标移到视口坐标，只移动不点击。
 - `clickat X Y [--right] [--double] [--hold MS]`：移动并点击视口坐标，不经过 DOM 定位；`--hold` 是长按，按下保持 MS 毫秒再松开。
 - `drag X1 Y1 X2 Y2 [--duration MS]`：按住左键从 (X1, Y1) 拖到 (X2, Y2)，移动时带着按住的左键，默认用 800 毫秒拖完。用于滑块、拖拽排序等。
 - `vclick IMAGE [--threshold 0.8] [--right] [--double]`：`find` + `clickat` 一步完成；找不到匹配就报错，不盲点。
+- `gap BG [--piece PIECE] [--max N]`：滑块验证码缺口识别——在背景图（PNG/JPEG/WebP）里找被压暗的缺口区域，返回按分数排序的候选坐标；纯本地计算，不需要浏览器。给了 `--piece` 滑块图会按形状吻合度打分，多缺口干扰时返回多个候选，配合 `drag` 完成拖动。
 - `wait`：等待选择器、文字、URL、元素消失或固定时间。
 - `front`：将当前页面切到前台。
 - `tabs`、`tab ...`：列出、切换、新建或关闭标签页。
@@ -47,7 +48,7 @@ cargo install --path .
 
 `find`/`vclick` 的模板图片从 `webctl screenshot` 截的图里裁出来即可。匹配用的是灰度归一化互相关，对亮度和对比度变化不敏感，但**不做缩放不变性**：页面缩放（Ctrl+滚轮）或设备像素比变了，模板就要重裁。坐标一律是视口 CSS 像素，和 `clickat`、`move` 通用。
 
-`move`/`clickat`/`vclick`/`drag` 的移动轨迹模拟真人：从上一次停下的位置出发（按会话记在 `<WEBCTL_HOME>/sessions/<会话>.mouse`），走带随机弯曲的贝塞尔曲线，先慢后快再慢，落点精确。点击仍是浏览器级真实鼠标事件，只是目标从 DOM 元素换成了坐标，可以点 canvas、封闭 shadow root 等选择器够不着的地方。这些都是通用输入操作：webctl 不识别验证码内容，也不自动解题，点哪里、按多久、拖到哪由调用方给出。
+`move`/`clickat`/`vclick`/`drag` 的移动轨迹模拟真人：从上一次停下的位置出发（按会话记在 `<WEBCTL_HOME>/sessions/<会话>.mouse`），走带随机弯曲的贝塞尔曲线，先慢后快再慢，落点精确。点击仍是浏览器级真实鼠标事件，只是目标从 DOM 元素换成了坐标，可以点 canvas、封闭 shadow root 等选择器够不着的地方。这些都是通用输入操作：webctl 不自动解题，点哪里、按多久、拖到哪由调用方给出；`gap` 只回答"缺口在图里哪个位置"这个纯图像问题，拖不拖、拖到哪个候选、过没过都仍由调用方判断。
 
 ## 日志
 

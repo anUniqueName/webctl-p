@@ -58,6 +58,336 @@ pub fn decode_png(bytes: &[u8]) -> Result<GrayImage> {
     })
 }
 
+/// 带透明通道的图：灰度 + 可选 alpha。滑块小块用 alpha 抠出形状轮廓。
+pub struct Image {
+    pub gray: GrayImage,
+    pub alpha: Option<Vec<u8>>,
+}
+
+/// 解码 PNG/JPEG/WebP 并转成灰度，保留 alpha 通道（有的话）。
+/// PNG 走内置解码器，其余格式用 image crate。
+pub fn decode_image(bytes: &[u8]) -> Result<Image> {
+    const PNG_MAGIC: &[u8] = b"\x89PNG";
+    if bytes.starts_with(PNG_MAGIC) {
+        return decode_png_rgba(bytes);
+    }
+    let dynamic = image::load_from_memory(bytes).context("无法解码图片（支持 PNG/JPEG/WebP）")?;
+    let rgba = dynamic.to_rgba8();
+    let (width, height) = (rgba.width() as usize, rgba.height() as usize);
+    let mut gray = vec![0u8; width * height];
+    let mut alpha = vec![0u8; width * height];
+    let mut any_transparent = false;
+    for (i, px) in rgba.pixels().enumerate() {
+        let [r, g, b, a] = px.0;
+        gray[i] = ((r as u32 * 299 + g as u32 * 587 + b as u32 * 114) / 1000) as u8;
+        alpha[i] = a;
+        if a < 255 {
+            any_transparent = true;
+        }
+    }
+    Ok(Image {
+        gray: GrayImage {
+            width,
+            height,
+            data: gray,
+        },
+        alpha: any_transparent.then_some(alpha),
+    })
+}
+
+/// PNG 解码，比 decode_png 多保留 alpha 通道
+fn decode_png_rgba(bytes: &[u8]) -> Result<Image> {
+    let mut decoder = png::Decoder::new(bytes);
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = decoder.read_info().context("无法解析 PNG 头")?;
+    let mut buf = vec![0; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).context("无法解码 PNG 像素")?;
+    let data = &buf[..info.buffer_size()];
+    let (width, height) = (info.width as usize, info.height as usize);
+    let channels = match info.color_type {
+        png::ColorType::Grayscale => 1,
+        png::ColorType::GrayscaleAlpha => 2,
+        png::ColorType::Rgb | png::ColorType::Indexed => 3,
+        png::ColorType::Rgba => 4,
+    };
+    let has_alpha = matches!(info.color_type, png::ColorType::GrayscaleAlpha | png::ColorType::Rgba);
+    let mut gray = vec![0u8; width * height];
+    let mut alpha = vec![0u8; width * height];
+    let mut any_transparent = false;
+    for (i, px) in gray.iter_mut().enumerate() {
+        let p = &data[i * channels..i * channels + channels];
+        *px = if channels <= 2 {
+            p[0]
+        } else {
+            ((p[0] as u32 * 299 + p[1] as u32 * 587 + p[2] as u32 * 114) / 1000) as u8
+        };
+        if has_alpha {
+            let a = p[channels - 1];
+            alpha[i] = a;
+            if a < 255 {
+                any_transparent = true;
+            }
+        }
+    }
+    Ok(Image {
+        gray: GrayImage {
+            width,
+            height,
+            data: gray,
+        },
+        alpha: (has_alpha && any_transparent).then_some(alpha),
+    })
+}
+
+/// 一个缺口候选：缺口在图里的包围盒和各项打分依据
+#[derive(Debug, Clone)]
+pub struct Gap {
+    pub x: usize,
+    pub y: usize,
+    pub w: usize,
+    pub h: usize,
+    pub score: f64,
+    /// 和滑块形状的 IoU（没给滑块图时为 0）
+    pub iou: f64,
+    /// 在几个暗度阈值下都稳定出现
+    pub stability: usize,
+    /// 缺口内部相对周围的平均变暗量
+    pub darkness: f64,
+}
+
+/// 在滑块验证码背景图里找缺口：缺口是一块被压暗、边缘描了亮边的区域。
+/// 做法是算每个像素相对局部均值的变暗量（盒式模糊减原图），在多个阈值下取连通域，
+/// 跨阈值稳定出现、暗得明显、形状和滑块块吻合（给了 --piece 时）的候选排前面。
+/// 多缺口干扰时全都会返回，按分数从高到低，最多 max 个。
+pub fn find_gap(bg: &GrayImage, piece: Option<&Image>, max: usize) -> Vec<Gap> {
+    if max == 0 || bg.width < 20 || bg.height < 20 {
+        return vec![];
+    }
+    // 滑块形状：alpha 抠出非透明部分的包围盒
+    let shape = piece.and_then(|p| p.alpha.as_ref().and_then(|a| shape_mask(&p.gray, a)));
+    let (pw, ph) = shape
+        .as_ref()
+        .map(|(w, h, _)| (*w, *h))
+        .unwrap_or((0, 0));
+    // 局部均值的窗口要比缺口还大，缺口内部才会整体显得比周围暗：半径取滑块尺寸的一半
+    let radius = shape
+        .as_ref()
+        .map(|(w, h, _)| (*w).max(*h) / 2)
+        .unwrap_or(16)
+        .clamp(12, 40);
+    let integral = Integral::new(bg);
+    let mut dark = vec![0f32; bg.width * bg.height];
+    for y in 0..bg.height {
+        let y0 = y.saturating_sub(radius);
+        let y1 = (y + radius + 1).min(bg.height);
+        for x in 0..bg.width {
+            let x0 = x.saturating_sub(radius);
+            let x1 = (x + radius + 1).min(bg.width);
+            let (sum, _) = integral.window(x0, y0, x1 - x0, y1 - y0);
+            let mean = sum / ((x1 - x0) * (y1 - y0)) as f64;
+            dark[y * bg.width + x] = (mean - bg.data[y * bg.width + x] as f64).max(0.0) as f32;
+        }
+    }
+
+    let mut detections: Vec<Detection> = Vec::new();
+    for th in [10.0f32, 15.0, 20.0, 25.0, 30.0] {
+        for comp in components(&dark, bg.width, bg.height, th) {
+            // 缺口尺寸和滑块差不多，太宽太扁的都是背景噪声
+            let (min_w, min_h, max_w, max_h) = if shape.is_some() {
+                (
+                    pw.saturating_sub(25).max(15),
+                    ph.saturating_sub(25).max(15),
+                    pw + 25,
+                    ph + 25,
+                )
+            } else {
+                (20, 20, 130, 130)
+            };
+            if comp.w < min_w || comp.h < min_h || comp.w > max_w || comp.h > max_h {
+                continue;
+            }
+            let darkness = comp.pixels.iter().map(|&i| dark[i as usize] as f64).sum::<f64>()
+                / comp.pixels.len() as f64;
+            let iou = shape
+                .as_ref()
+                .map(|(sw, sh, mask)| shape_iou(&comp, bg.width, *sw, *sh, mask))
+                .unwrap_or(0.0);
+            detections.push(Detection {
+                darkness,
+                iou,
+                ..comp
+            });
+        }
+    }
+    // 按位置合并不同阈值下的同一处检出：稳定性 +1，iou/暗度取最大
+    detections.sort_by(|a, b| {
+        b.darkness
+            .partial_cmp(&a.darkness)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut merged: Vec<Gap> = Vec::new();
+    for d in detections {
+        let hit = merged
+            .iter_mut()
+            .find(|m| d.x.abs_diff(m.x) < 12 && d.y.abs_diff(m.y) < 12);
+        match hit {
+            Some(m) => {
+                // 包围盒取并集：高阈值下的检出偏小，别把完整缺口丢掉
+                let (x1, y1) = ((m.x + m.w).max(d.x + d.w), (m.y + m.h).max(d.y + d.h));
+                m.x = m.x.min(d.x);
+                m.y = m.y.min(d.y);
+                m.w = x1 - m.x;
+                m.h = y1 - m.y;
+                m.stability += 1;
+                m.iou = m.iou.max(d.iou);
+                m.darkness = m.darkness.max(d.darkness);
+            }
+            None => merged.push(Gap {
+                x: d.x,
+                y: d.y,
+                w: d.w,
+                h: d.h,
+                score: 0.0,
+                iou: d.iou,
+                stability: 1,
+                darkness: d.darkness,
+            }),
+        }
+    }
+    for m in merged.iter_mut() {
+        // darkness 封顶 60：均匀深色背景区域不该靠暗度压过跨阈值稳定和形状吻合；
+        // 形状 IoU 权重最高：多缺口干扰时，和滑块形状吻合的才是真缺口
+        m.score = m.stability as f64 + m.iou * 4.0 + m.darkness.min(60.0) / 30.0;
+    }
+    merged.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    merged.truncate(max);
+    merged
+}
+
+struct Detection {
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    pixels: Vec<u32>,
+    darkness: f64,
+    iou: f64,
+}
+
+/// alpha>10 的包围盒和二值形状掩码；全透明（没有有效像素）时返回 None
+fn shape_mask(piece: &GrayImage, alpha: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
+    let (mut x0, mut y0, mut x1, mut y1) = (piece.width, piece.height, 0usize, 0usize);
+    let mut any = false;
+    for y in 0..piece.height {
+        for x in 0..piece.width {
+            if alpha[y * piece.width + x] > 10 {
+                x0 = x0.min(x);
+                y0 = y0.min(y);
+                x1 = x1.max(x);
+                y1 = y1.max(y);
+                any = true;
+            }
+        }
+    }
+    if !any {
+        return None;
+    }
+    let (w, h) = (x1 - x0 + 1, y1 - y0 + 1);
+    let mut mask = vec![0u8; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            mask[y * w + x] = (alpha[(y0 + y) * piece.width + x0 + x] > 10) as u8;
+        }
+    }
+    Some((w, h, mask))
+}
+
+/// 连通域掩码最近邻缩放到滑块形状大小后算 IoU
+fn shape_iou(comp: &Detection, img_width: usize, sw: usize, sh: usize, shape: &[u8]) -> f64 {
+    // 连通域掩码标进自己的包围盒
+    let mut mask = vec![0u8; comp.w * comp.h];
+    for &i in &comp.pixels {
+        let (px, py) = (i as usize % img_width - comp.x, i as usize / img_width - comp.y);
+        mask[py * comp.w + px] = 1;
+    }
+    // 最近邻采样到滑块形状大小后算 IoU
+    let (mut inter, mut union) = (0usize, 0usize);
+    for y in 0..sh {
+        for x in 0..sw {
+            let c = mask[(y * comp.h / sh) * comp.w + x * comp.w / sw];
+            let s = shape[y * sw + x];
+            inter += (c & s) as usize;
+            union += (c | s) as usize;
+        }
+    }
+    if union == 0 {
+        0.0
+    } else {
+        inter as f64 / union as f64
+    }
+}
+
+/// dark > th 的 4 邻接连通域，面积 300..=8000 的才保留
+fn components(dark: &[f32], width: usize, height: usize, th: f32) -> Vec<Detection> {
+    let mut visited = vec![false; width * height];
+    let mut out = Vec::new();
+    for start in 0..width * height {
+        if visited[start] || dark[start] <= th {
+            continue;
+        }
+        let mut stack = vec![start as u32];
+        visited[start] = true;
+        let mut pixels: Vec<u32> = Vec::new();
+        let (mut x0, mut y0, mut x1, mut y1) = (width, height, 0usize, 0usize);
+        let mut too_big = false;
+        while let Some(i) = stack.pop() {
+            let i = i as usize;
+            let (x, y) = (i % width, i / width);
+            x0 = x0.min(x);
+            x1 = x1.max(x);
+            y0 = y0.min(y);
+            y1 = y1.max(y);
+            if !too_big {
+                pixels.push(i as u32);
+                if pixels.len() > 8000 {
+                    too_big = true;
+                }
+            }
+            for next in [
+                (x > 0).then(|| i - 1),
+                (x + 1 < width).then(|| i + 1),
+                (y > 0).then(|| i - width),
+                (y + 1 < height).then(|| i + width),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if !visited[next] && dark[next] > th {
+                    visited[next] = true;
+                    stack.push(next as u32);
+                }
+            }
+        }
+        if too_big || pixels.len() < 300 {
+            continue;
+        }
+        out.push(Detection {
+            x: x0,
+            y: y0,
+            w: x1 - x0 + 1,
+            h: y1 - y0 + 1,
+            pixels,
+            darkness: 0.0,
+            iou: 0.0,
+        });
+    }
+    out
+}
+
 /// 在 haystack 里找 template，返回 score >= threshold 的匹配，按分数从高到低，最多 max 个。
 /// 找不到或模板比图还大时返回空 vec。
 pub fn find(haystack: &GrayImage, template: &GrayImage, threshold: f64, max: usize) -> Vec<Match> {
@@ -440,5 +770,127 @@ mod tests {
                 );
             }
         }
+    }
+    /// 捏一块压暗的拼图状缺口（方块加圆形凸起），验证能找到
+    fn notch_image(width: usize, height: usize) -> (GrayImage, Vec<u8>) {
+        // 形状掩码：32x32 方块 + 顶部半径 10 的圆
+        let (w, h) = (40usize, 50usize);
+        let mut mask = vec![0u8; w * h];
+        for y in 10..h {
+            for x in 4..w - 4 {
+                mask[y * w + x] = 1;
+            }
+        }
+        for y in 0..20 {
+            for x in 0..w {
+                let dx = x as i64 - 20;
+                let dy = y as i64 - 10;
+                if dx * dx + dy * dy <= 100 {
+                    mask[y * w + x] = 1;
+                }
+            }
+        }
+        // 有结构的底图：低频渐变加小块纹理，接近真实验证码背景
+        let mut page = GrayImage {
+            width,
+            height,
+            data: (0..width * height)
+                .map(|i| {
+                    let (x, y) = (i % width, i / width);
+                    (100 + (x * 3 + y * 7) % 50 + (x / 4 + y / 4) % 2 * 20) as u8
+                })
+                .collect(),
+        };
+        // 缺口处恒定压暗 50
+        let (nx, ny) = (100usize, 40usize);
+        for y in 0..h {
+            for x in 0..w {
+                if mask[y * w + x] == 1 {
+                    let i = (ny + y) * width + nx + x;
+                    page.data[i] = page.data[i].saturating_sub(50);
+                }
+            }
+        }
+        (page, mask)
+    }
+
+    #[test]
+    fn finds_darkened_notch_without_piece() {
+        let (page, _mask) = notch_image(220, 140);
+        let gaps = find_gap(&page, None, 5);
+        // 没有滑块形状可参考时会返回多个候选，缺口（100,40,40x50）要在其中
+        assert!(
+            gaps.iter()
+                .any(|g| g.x.abs_diff(100) <= 12 && g.y <= 90 && g.y + g.h >= 40),
+            "候选里应包含缺口位置：{gaps:?}"
+        );
+    }
+
+    #[test]
+    fn tolerates_fully_transparent_piece() {
+        // 抠坏的全透明滑块图：不应 panic，退化成无形状打分
+        let (page, _mask) = notch_image(220, 140);
+        let piece = Image {
+            gray: GrayImage {
+                width: 40,
+                height: 50,
+                data: vec![128; 40 * 50],
+            },
+            alpha: Some(vec![0; 40 * 50]),
+        };
+        let gaps = find_gap(&page, Some(&piece), 5);
+        assert!(
+            gaps.iter()
+                .any(|g| g.x.abs_diff(100) <= 12 && g.y <= 90 && g.y + g.h >= 40),
+            "候选里应包含缺口位置：{gaps:?}"
+        );
+    }
+
+    #[test]
+    fn decodes_jpeg() {
+        // image crate 编码一张 JPEG 再走 decode_image 解码回来
+        let mut img = image::RgbImage::new(16, 12);
+        for (x, y, px) in img.enumerate_pixels_mut() {
+            *px = image::Rgb([(x * 16) as u8, (y * 20) as u8, 128]);
+        }
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut buf, image::ImageFormat::Jpeg)
+            .expect("编码 JPEG 失败");
+        let decoded = decode_image(buf.get_ref()).expect("JPEG 解码失败");
+        assert_eq!((decoded.gray.width, decoded.gray.height), (16, 12));
+        assert!(decoded.alpha.is_none(), "JPEG 没有 alpha 通道");
+        // 左上角的红色分量应该在 0 附近、右下角接近 240
+        assert!(decoded.gray.data[0] < 60, "{:?}", decoded.gray.data[0]);
+        let last = decoded.gray.data[16 * 12 - 1];
+        assert!(last > 150, "{last}");
+    }
+
+    #[test]
+    fn finds_darkened_notch_with_piece_shape() {
+        let (page, mask) = notch_image(220, 140);
+        let piece = Image {
+            gray: GrayImage {
+                width: 40,
+                height: 50,
+                data: vec![128; 40 * 50],
+            },
+            alpha: Some(mask.iter().map(|&v| v * 255).collect()),
+        };
+        let gaps = find_gap(&page, Some(&piece), 3);
+        assert!(!gaps.is_empty(), "应该检出缺口");
+        let g = &gaps[0];
+        assert!(
+            g.x.abs_diff(100) <= 12 && g.y.abs_diff(40) <= 12,
+            "位置偏差过大：{g:?}"
+        );
+        assert!(g.iou > 0.5, "形状应该吻合：{g:?}");
+    }
+
+    #[test]
+    fn rejects_plain_noise() {
+        let page = noise_image(220, 140);
+        let gaps = find_gap(&page, None, 3);
+        assert!(gaps.is_empty(), "纯噪声图不该有缺口：{gaps:?}");
     }
 }

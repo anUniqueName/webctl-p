@@ -240,6 +240,18 @@ enum Command {
         #[arg(long, default_value_t = 30_000)]
         timeout: u64,
     },
+    /// 滑块验证码：在背景图里找缺口位置（PNG/JPEG/WebP），纯本地计算，不需要浏览器
+    ///
+    /// 配合 --piece 给出滑块小块图片会按形状给候选打分；多缺口干扰时返回多个候选。
+    Gap {
+        /// 背景图（带缺口的图）
+        bg: PathBuf,
+        /// 滑块小块图片，用它的形状给候选打分
+        #[arg(long)]
+        piece: Option<PathBuf>,
+        #[arg(long, default_value_t = 3)]
+        max: usize,
+    },
     Front,
     /// 列出标签页（序号从 0 开始）
     Tabs,
@@ -325,6 +337,15 @@ fn session_name(flag: Option<String>) -> String {
 }
 
 fn run(cli: Cli, session: &str) -> Result<Output> {
+    // gap 是纯本地图像计算，不碰浏览器
+    if let Command::Gap {
+        ref bg,
+        ref piece,
+        max,
+    } = cli.command
+    {
+        return page::gap_files(bg, piece.as_deref(), max).map(Output::Json);
+    }
     // status、close 只查询已有会话，浏览器没在运行时不能为此去启动一个
     if cli.cdp.is_none()
         && matches!(cli.command, Command::Status | Command::Close)
@@ -484,6 +505,7 @@ fn dispatch(browser: &mut Browser, command: Command) -> Result<Output> {
             timeout,
         )?,
         Command::Turnstile { timeout } => page::turnstile(browser, timeout)?,
+        Command::Gap { .. } => unreachable!("gap 是纯本地命令，在 run() 里已提前处理"),
         Command::Front => page::front(browser)?,
         Command::Tabs => page::tabs(browser)?,
         Command::Tab { action, value } => page::tab(browser, &action, value.as_deref())?,

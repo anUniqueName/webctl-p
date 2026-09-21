@@ -43,8 +43,9 @@ description: 用命令行操作 Chrome 浏览器。需要打开网页、读取�
 | `eval JS` / `eval --file 路径` `[--max N]` | 执行 JS 并返回结果；可以写 `return`、`await`，同一页面上多次 eval 可以重复声明同名 `const`，和页面自己的全局变量重名也不报错，不用包成 `(() => {...})()`；结果超过 `--max`（默认 20000 字）截成字符串，输出带 `truncated`、`length`，这时不能当 JSON 解析，加大 `--max` 重跑 |
 | `screenshot [路径] [--full] [--annotate]` | 截图（会先把当前标签页切到前台）；路径是位置参数，直接写在后面，没有 `--path`；`--annotate` 在图上标出元素编号；路径写 `.jpg` 存成 JPEG，体积小，适合当证据。返回里有截图时的 `url`、`title`、`taken_at`（本地时间），可以核对拍到的是不是要的页面；文件已存在时照样覆盖，返回 `"overwrote": true` |
 | `wait [--selector CSS] [--gone CSS] [--text 文字] [--url 片段] [--ms N] [--timeout 毫秒]` | 等待条件全部满足；`--selector` 等元素出现且可见，`script`、`style` 这类不渲染的元素按存在算（可以等 `#__NEXT_DATA__`） |
-| `find 模板图 [--threshold 0.8] [--max N]` | 视觉识别：在页面截图里找模板图片，返回匹配中心坐标和相似度 |
+| `find 模板图 [--threshold 0.8] [--max N]` | 视觉识别：在页面截图里找模板图片（PNG/JPEG/WebP），返回匹配中心坐标和相似度 |
 | `vclick 模板图 [--threshold 0.8]` | 找到模板图位置并以拟人轨迹移动点击；找不到就报错，不盲点 |
+| `gap 背景图 [--piece 滑块图] [--max N]` | 滑块验证码：在背景图（PNG/JPEG/WebP）里找缺口位置，纯本地计算不需要浏览器 |
 | `move X Y` / `clickat X Y [--right] [--double] [--hold 毫秒]` | 拟人轨迹移动 / 点击视口坐标，不经过 DOM 定位，可点 canvas、封闭 shadow root；`--hold` 是长按，按下保持指定毫秒再松开 |
 | `drag X1 Y1 X2 Y2 [--duration 毫秒]` | 按住左键从起点拖到终点（拟人轨迹，默认用 800ms），用于滑块、拖拽排序 |
 | `tabs` / `tab 序号` / `tab new [URL]` / `tab close [序号]` | 标签页管理，序号从 0 开始；关掉当前页后新的当前页不会选别的会话正在用的页；剩下的页都是别的会话的时返回 `"current": null`，不新建页，下一条命令会自动选页或新建空白页 |
@@ -89,7 +90,7 @@ webctl click e7 --on-dialog accept   # 确认删除
 
 需要登录、扫码时：运行 `webctl front` 把窗口切到前台，请用户手动完成，然后用 `webctl wait --url 登录后地址的片段 --timeout 300000`（或 `--selector`、`--text`）等待，再继续。
 
-遇到人机验证，默认也这样请用户处理。调用 webctl 的技能明确允许 agent 自己处理验证时，按那个技能的规定做（能试几次、试不过怎么记）。webctl 提供的只是通用输入操作：`turnstile`（量出 Cloudflare 控件位置，点一下勾选框）、`clickat`、`clickat --hold`（长按）、`drag`（按住拖动）、`find`/`vclick`（按截图里的图案找位置再点）。它不识别验证码内容，也不自动解题：点哪里、按多久、拖到哪，都由调用方看截图后给出。
+遇到人机验证，默认也这样请用户处理。调用 webctl 的技能明确允许 agent 自己处理验证时，按那个技能的规定做（能试几次、试不过怎么记）。webctl 提供的只是通用输入和图像识别原语：`turnstile`（量出 Cloudflare 控件位置，点一下勾选框）、`clickat`、`clickat --hold`（长按）、`drag`（按住拖动）、`find`/`vclick`（按截图里的图案找位置再点）、`gap`（在滑块背景图里找缺口坐标）。它不自动解题：点哪里、按多久、拖到哪个候选，都由调用方看截图后给出。
 
 `open`、`back`、`reload`、`eval` 认出拦截页或错误页时，返回里会带 `"blocked": "<类型>"` 和一条 `hint`。这时页面上没有目标内容，别去 snapshot 或 text 找数据，也别当成"0 个结果"。点筛选、翻页后跳出来的拦截页不经过 `open`，所以 `eval` 的返回也要看有没有 `blocked`。
 
@@ -152,3 +153,18 @@ webctl vclick button.png            # 或者直接找+移+点一步完成
 ```
 
 模板必须和页面同一缩放比例、同一 devicePixelRatio，从刚截的图里裁最稳；匹配对亮度对比度变化不敏感，但页面缩放（Ctrl+滚轮）变了就要重裁。`find` 返回多个匹配加 `--max N`；匹配不上时适当降低 `--threshold`（默认 0.8）。`clickat` 按坐标直接点，没有遮挡检查。
+
+## 滑块验证码
+
+`gap` 在滑块背景图里找缺口位置，配合 `drag` 完成拖动，全程本地计算、不需要训练模型：
+
+```sh
+# 拿到背景图和滑块小块：eval 里读 img.src / canvas.toDataURL 存成文件，或对元素截图
+webctl gap bg.png --piece piece.png
+# {"candidates":[{"x":153,"y":90,"w":42,"h":45,"cx":174,"cy":112,"score":9.96,"iou":0.74,...}], ...}
+webctl drag <滑块把手x> <滑块把手y> <把手x + 缺口x*显示比例> <把手y>
+```
+
+原理：缺口是一块被压暗、边缘带亮边的区域。`gap` 算每个像素相对大窗口局部均值的变暗量，在多个阈值下取连通域，跨阈值稳定、暗得明显、尺寸和滑块相当的候选排前面；给了 `--piece` 还会算连通域和滑块形状（alpha 通道）的 IoU。多缺口干扰时几个候选都会返回，第一个拖不过就试下一个（验证码本身允许重试）。
+
+注意：背景图要用**页面上实际显示的那张**（`eval` 取 `img.currentSrc` 下载，或对元素截图），别用打乱的原始切片图；图和滑块要同一缩放比例。坐标是图片像素，乘 `显示宽度/图片宽度` 换算成拖动距离。`gap` 只给坐标，拖不拖、拖到哪个候选、过没过由你判断。
