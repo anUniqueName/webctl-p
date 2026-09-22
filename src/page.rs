@@ -26,17 +26,11 @@ pub fn open(
     let url = normalize_url(url)?;
     if new_tab {
         // 先建空白页再走同一条导航流程，保证等到的是目标页面的加载，而不是 about:blank
-        let result =
-            browser
-                .cdp
-                .call("Target.createTarget", json!({"url": "about:blank"}), None)?;
-        let target = result["targetId"]
-            .as_str()
-            .ok_or_else(|| anyhow!("Chrome 未返回 targetId"))?
-            .to_owned();
+        let target = browser.new_blank()?;
         browser.set_current(target)?;
     }
     let session = browser.attach_current()?;
+    drop_queued_load_events(browser, &session);
     let navigation = browser
         .cdp
         .call("Page.navigate", json!({"url": url}), Some(&session))?;
@@ -230,9 +224,7 @@ pub fn turnstile(browser: &mut Browser, timeout_ms: u64) -> Result<Value> {
     let y = number("y")? + number("h")? / 2.0;
     mouse(browser, &session, "mouseMoved", x, y, "none", 0, 0)?;
     thread::sleep(Duration::from_millis(30));
-    mouse(browser, &session, "mousePressed", x, y, "left", 1, 1)?;
-    thread::sleep(Duration::from_millis(30));
-    mouse(browser, &session, "mouseReleased", x, y, "left", 0, 1)?;
+    click_buttons(browser, &session, x, y, false, false, None)?;
 
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     let mut passed = false;
@@ -325,19 +317,9 @@ pub fn click(
     // 先定位（会滚动页面）再开始记录变化，免得把滚动触发的懒加载内容算成点击结果
     let (x, y) = locate(browser, &session, target, force)?;
     let before = begin_observe(browser, &session)?;
-    let button = if right { "right" } else { "left" };
-    let buttons = if right { 2 } else { 1 };
     mouse(browser, &session, "mouseMoved", x, y, "none", 0, 0)?;
     thread::sleep(Duration::from_millis(30));
-    mouse(browser, &session, "mousePressed", x, y, button, buttons, 1)?;
-    thread::sleep(Duration::from_millis(30));
-    mouse(browser, &session, "mouseReleased", x, y, button, 0, 1)?;
-    if double {
-        thread::sleep(Duration::from_millis(30));
-        mouse(browser, &session, "mousePressed", x, y, button, buttons, 2)?;
-        thread::sleep(Duration::from_millis(30));
-        mouse(browser, &session, "mouseReleased", x, y, button, 0, 2)?;
-    }
+    click_buttons(browser, &session, x, y, right, double, None)?;
     finish_observe(browser, &session, before, settle_ms, timeout_ms)
 }
 
@@ -402,15 +384,18 @@ pub fn find_image(browser: &mut Browser, path: &Path, threshold: f64, max: usize
 pub fn gap_files(bg_path: &Path, piece_path: Option<&Path>, max: usize) -> Result<Value> {
     let bg_bytes =
         fs::read(bg_path).with_context(|| format!("无法读取背景图 {}", bg_path.display()))?;
-    let bg = vision::decode_image(&bg_bytes)
-        .with_context(|| format!("背景图 {} 无法解码（支持 PNG/JPEG/WebP）", bg_path.display()))?;
+    let bg = vision::decode_image(&bg_bytes).with_context(|| {
+        format!(
+            "背景图 {} 无法解码（支持 PNG/JPEG/WebP）",
+            bg_path.display()
+        )
+    })?;
     let piece = match piece_path {
         Some(p) => {
             let bytes = fs::read(p).with_context(|| format!("无法读取滑块图 {}", p.display()))?;
-            Some(
-                vision::decode_image(&bytes)
-                    .with_context(|| format!("滑块图 {} 无法解码（支持 PNG/JPEG/WebP）", p.display()))?,
-            )
+            Some(vision::decode_image(&bytes).with_context(|| {
+                format!("滑块图 {} 无法解码（支持 PNG/JPEG/WebP）", p.display())
+            })?)
         }
         None => None,
     };
@@ -440,13 +425,19 @@ pub fn gap_files(bg_path: &Path, piece_path: Option<&Path>, max: usize) -> Resul
         "height": bg.gray.height,
         "candidates": candidates
     });
-    if piece.as_ref().is_some_and(|p| p.alpha.is_none()) {
-        output["note"] =
-            json!("滑块图没有透明通道，形状打分（iou）未生效；用带 alpha 的 PNG/WebP 滑块图效果最好");
+    if piece.is_none() {
+        output["note"] = json!(
+            "没给 --piece：只按暗度和固定尺寸范围猜，候选很可能不是真缺口；尽量带上滑块图（最好是带 alpha 的 PNG/WebP）"
+        );
+    } else if piece.as_ref().is_some_and(|p| p.alpha.is_none()) {
+        output["note"] = json!(
+            "滑块图没有透明通道，形状打分（iou）未生效；用带 alpha 的 PNG/WebP 滑块图效果最好"
+        );
     }
     if gaps.is_empty() {
-        output["hint"] =
-            json!("没有找到缺口：确认背景图是没缩放的原始图；给了 --piece 时滑块图要和背景图同一比例");
+        output["hint"] = json!(
+            "没有找到缺口：确认背景图是页面上实际显示的那张（不是打乱的原始切片）；给了 --piece 时滑块图要和背景图同一比例"
+        );
     }
     Ok(output)
 }
@@ -599,6 +590,19 @@ fn capture_gray(browser: &mut Browser, session: &str) -> Result<(vision::GrayIma
 
 const FILL_CONTROL: &str = "if (!el.matches('input,textarea,select,[contenteditable]') && el.closest('label')?.control) el = el.closest('label').control;";
 
+/// 当前真正有焦点的元素。目标在同源 iframe、开放 shadow root 里时，
+/// 顶层文档的 activeElement 是 iframe 或宿主元素，要顺着 contentDocument / shadowRoot 再往里找一层
+const ACTIVE_ELEMENT_JS: &str = r#"(() => {
+          let el = document.activeElement;
+          while (el) {
+            let inner = el.shadowRoot ? el.shadowRoot.activeElement : null;
+            if (!inner && el.tagName === 'IFRAME') try { inner = el.contentDocument ? el.contentDocument.activeElement : null; } catch (_) {}
+            if (!inner) break;
+            el = inner;
+          }
+          return el;
+        })()"#;
+
 pub fn fill(
     browser: &mut Browser,
     target: &str,
@@ -624,17 +628,25 @@ pub fn fill(
             }}
             {}"#,
             if append {
-                "try { el.setSelectionRange(el.value.length, el.value.length); } catch (_) { const r=document.createRange(); r.selectNodeContents(el); r.collapse(false); const s=getSelection(); s.removeAllRanges(); s.addRange(r); } return true;"
+                "try { el.setSelectionRange(el.value.length, el.value.length); } catch (_) { const r=document.createRange(); r.selectNodeContents(el); r.collapse(false); const s=getSelection(); s.removeAllRanges(); s.addRange(r); } return el.matches('input[type=password]');"
             } else {
-                "return true;"
+                "return el.matches('input[type=password]');"
             }
         ),
     );
-    eval_value(browser, &session, &focus)?;
+    // 目标是密码框时在输出里标一个 masked，日志会据此把 argv 里的那段文字换成 ***。
+    // stdout 照旧输出真实的 value，只多这一个标记
+    let masked = eval_value(browser, &session, &focus)? == true;
     if !append {
         select_all(browser, &session)?;
     }
-    if text.is_empty() {
+    if !text.is_empty() {
+        browser
+            .cdp
+            .call("Input.insertText", json!({"text": text}), Some(&session))?;
+    } else if !append {
+        // 清空：全选之后发一次 Backspace 删掉选中的内容。
+        // --append 没有选中内容，这一下会把原有内容的最后一个字删掉，所以不发
         dispatch_key(
             browser,
             &session,
@@ -657,21 +669,24 @@ pub fn fill(
             None,
             None,
         )?;
-    } else {
-        browser
-            .cdp
-            .call("Input.insertText", json!({"text": text}), Some(&session))?;
     }
+    // 从当前焦点读回填好的值，不重新定位目标：输入本身可能让目标失效
+    // （text= 找的是随内容变化的文字、页面重新渲染丢掉 data-webctl-ref），
+    // 那时重新定位会报错，看起来像没填进去，重试一次又会填两遍。
+    // 焦点由上面那步保证落在目标或它的子元素上。读不回来也不算失败，输出里 value 为 null
     let value = eval_value(
         browser,
         &session,
-        &target_expression(
-            target,
-            &format!("{FILL_CONTROL} return el.isContentEditable ? el.innerText : el.value;"),
+        &format!(
+            "(el => !el ? null : (el.isContentEditable ? el.innerText : el.value))({ACTIVE_ELEMENT_JS})"
         ),
-    )?;
+    )
+    .unwrap_or(Value::Null);
     let mut output = finish_observe(browser, &session, before, settle_ms, timeout_ms)?;
     output["value"] = value;
+    if masked {
+        output["masked"] = json!(true);
+    }
     Ok(output)
 }
 
@@ -683,6 +698,13 @@ pub fn type_text(
     timeout_ms: u64,
 ) -> Result<Value> {
     let session = browser.attach_current()?;
+    // 焦点在密码框上时标一个 masked，日志会据此把 argv 里的那段文字换成 ***
+    let masked = eval_value(
+        browser,
+        &session,
+        &format!("(el => !!el && el.matches('input[type=password]'))({ACTIVE_ELEMENT_JS})"),
+    )
+    .is_ok_and(|focused| focused == true);
     let before = begin_observe(browser, &session)?;
     for character in text.chars() {
         // 标点的虚拟键码不等于 ASCII 码（'.' 的 46 是 Delete 键），只对字母、数字、空格发按键事件
@@ -719,7 +741,11 @@ pub fn type_text(
             thread::sleep(Duration::from_millis(delay_ms));
         }
     }
-    finish_observe(browser, &session, before, settle_ms, timeout_ms)
+    let mut output = finish_observe(browser, &session, before, settle_ms, timeout_ms)?;
+    if masked {
+        output["masked"] = json!(true);
+    }
+    Ok(output)
 }
 
 pub fn press(browser: &mut Browser, key: &str, settle_ms: u64, timeout_ms: u64) -> Result<Value> {
@@ -918,7 +944,11 @@ pub fn screenshot(
             let metrics = browser
                 .cdp
                 .call("Page.getLayoutMetrics", json!({}), Some(&session))?;
-            let size = &metrics["cssContentSize"];
+            // 旧版 Chrome 没有 cssContentSize，退回 contentSize，否则宽高是 null、截不出图
+            let size = metrics
+                .get("cssContentSize")
+                .filter(|size| size.is_object())
+                .unwrap_or(&metrics["contentSize"]);
             params["clip"] = json!({
                 "x": 0,
                 "y": 0,
@@ -1011,11 +1041,15 @@ pub fn wait(browser: &mut Browser, conditions: WaitConditions<'_>) -> Result<Val
     let deadline = Instant::now() + Duration::from_millis(conditions.timeout_ms);
     let not_before = Instant::now() + Duration::from_millis(conditions.ms.unwrap_or(0));
     let expression = format!(
+        // 可见判定用 click、fill 那一份（ELEMENT_HELPERS_JS，含 opacity > 0）：
+        // 之前 wait 自己写了一份不看 opacity 的，元素还是 opacity:0 时 wait --selector 就放行，
+        // 紧接着的 click 又报"不可见"。
         // script、style 这类元素从不渲染，按"存在"算：之前 wait --selector '#__NEXT_DATA__' 一律等满超时
-        r#"(() => {{ const inert = el => ['script', 'style', 'template', 'meta', 'link', 'title', 'noscript'].includes(el.localName);
-        const visible = el => !!el && (inert(el) || el.getBoundingClientRect().width > 0 && el.getBoundingClientRect().height > 0 && getComputedStyle(el).display !== 'none' && getComputedStyle(el).visibility !== 'hidden');
+        r#"(() => {{ {ELEMENT_HELPERS_JS}
+        const inert = el => ['script', 'style', 'template', 'meta', 'link', 'title', 'noscript'].includes(el.localName);
+        const shown = el => !!el && (inert(el) || visible(el));
         // 看所有命中里有没有可见的，不只看第一个：第一个是隐藏的模板时，--selector 永远等不到、--gone 会提前放行
-        const any = s => [...document.querySelectorAll(s)].some(visible);
+        const any = s => [...document.querySelectorAll(s)].some(shown);
         const selector = {}, gone = {}, text = {}, url = {};
         return (!selector || any(selector)) && (!gone || !any(gone)) && (!text || (document.body?.innerText || '').includes(text)) && (!url || location.href.includes(url)); }})()"#,
         json!(conditions.selector),
@@ -1108,15 +1142,10 @@ pub fn tab(browser: &mut Browser, action: &str, value: Option<&str>) -> Result<V
         // 新建的空白页记在它们留下的状态文件里，别的会话会跳过这些页，每轮都多出几个空白页。
         // 除了刚关的页一个标签页都不剩时照旧新建空白页，和之前一样，窗口不会因为没有标签页而关掉
         if browser.state.current_target.as_deref() == Some(target.as_str()) {
-            browser.state.current_target = match browser.free_page(Some(&target))? {
+            let pages = browser.page_targets()?;
+            browser.state.current_target = match browser.free_page(&pages, Some(&target)) {
                 Some(free) => Some(free),
-                None if browser
-                    .page_targets()?
-                    .iter()
-                    .any(|page| page["targetId"] != target.as_str()) =>
-                {
-                    None
-                }
+                None if pages.iter().any(|page| page["targetId"] != target.as_str()) => None,
                 None => Some(browser.new_blank()?),
             };
             browser.save()?;
@@ -1133,6 +1162,7 @@ pub fn tab(browser: &mut Browser, action: &str, value: Option<&str>) -> Result<V
 
 pub fn back(browser: &mut Browser, timeout_ms: u64) -> Result<Value> {
     let session = browser.attach_current()?;
+    drop_queued_load_events(browser, &session);
     eval_value(browser, &session, "history.back(); true")?;
     wait_navigated(browser, &session, timeout_ms)?;
     let loaded = wait_loaded(browser, &session, timeout_ms)?;
@@ -1144,6 +1174,7 @@ pub fn back(browser: &mut Browser, timeout_ms: u64) -> Result<Value> {
 
 pub fn reload(browser: &mut Browser, timeout_ms: u64) -> Result<Value> {
     let session = browser.attach_current()?;
+    drop_queued_load_events(browser, &session);
     browser.cdp.call("Page.reload", json!({}), Some(&session))?;
     wait_navigated(browser, &session, timeout_ms)?;
     let loaded = wait_loaded(browser, &session, timeout_ms)?;
@@ -1236,8 +1267,11 @@ fn check_exception(result: &Value) -> Result<()> {
     let Some(details) = result.get("exceptionDetails") else {
         return Ok(());
     };
+    // throw '文字' 抛的不是 Error 对象，没有 description，内容在 exception.value 里；
+    // 只看 text 的话错误只剩一个 "Uncaught"
     let message = details["exception"]["description"]
         .as_str()
+        .or_else(|| details["exception"]["value"].as_str())
         .or_else(|| details["text"].as_str())
         .unwrap_or("JavaScript 执行失败");
     // description 带调用栈，只保留第一行
@@ -1392,9 +1426,14 @@ fn locate_once(
     force: bool,
 ) -> Result<(f64, f64)> {
     let body = format!(
-        r#"el.scrollIntoView({{block:'center', inline:'center'}});
+        // behavior:'instant' 不能省：页面设了 scroll-behavior:smooth 时滚动会做动画，
+        // 下一行量到的是动画中途的位置，点击会落到别处
+        r#"el.scrollIntoView({{block:'center', inline:'center', behavior:'instant'}});
         const rect = el.getBoundingClientRect(), localX = rect.left + rect.width / 2, localY = rect.top + rect.height / 2;
-        const hit = el.ownerDocument.elementFromPoint(localX, localY);
+        // 元素在开放 shadow root 里时，文档的 elementFromPoint 命中的是宿主元素，一律会误报遮挡；
+        // 从元素自己的根（shadow root 或文档）取命中元素，和 TEXT_TARGET_JS 一致
+        const root = el.getRootNode();
+        const hit = (root.elementFromPoint ? root : el.ownerDocument).elementFromPoint(localX, localY);
         // 盖在目标上的如果是它的祖先，或和它同在一个 label 里（标题文字盖住 checkbox 是常见写法），
         // 点这个位置浏览器照样会作用到目标，不算遮挡
         const label = hit && hit.closest && hit.closest('label');
@@ -1635,12 +1674,7 @@ fn finish_observe(
     }
     // 跳转途中执行 collect 可能报错，按已跳转处理
     let observed = eval_value(browser, session, &observe_call("collect")).unwrap_or(Value::Null);
-    let info = eval_value(
-        browser,
-        session,
-        "({url: location.href, title: document.title})",
-    )?;
-    let url = info["url"].as_str().unwrap_or_default();
+    let (url, title) = page_info(browser, session)?;
     // 页面换了新文档时，observe 的记录随旧文档一起丢失，collect 返回 null
     let navigated = navigated_event
         || observed.is_null()
@@ -1661,7 +1695,7 @@ fn finish_observe(
         "changes": {
             "navigated": navigated,
             "url": url,
-            "title": info["title"],
+            "title": title,
             "new_tabs": new_tabs,
             "text_changed": text_changed,
             "added": added
@@ -1713,6 +1747,15 @@ fn page_info(browser: &mut Browser, session: &str) -> Result<(String, String)> {
     ))
 }
 
+/// 丢掉本会话队列里已有的 load 事件。webctl 接手前页面可能还在加载，attach、Page.enable 期间
+/// 收到的是上一个文档的 load 事件；wait_loaded 先查队列，不丢就会立刻报 loaded:true。
+/// 只能在发起导航之前丢：之后丢会把新文档真正的 load 事件一起丢掉
+fn drop_queued_load_events(browser: &mut Browser, session: &str) {
+    browser.cdp.take_events(|event| {
+        event["sessionId"] == session && event["method"] == "Page.loadEventFired"
+    });
+}
+
 /// DOM 就绪后最多再等多久 load 事件。广告多的站 DOM 3–7 秒就好了，load 要等图片、广告、第三方脚本，
 /// 实测还要再晚 6–31 秒（2026-09-18，slickdeals、aliexpress、hlcwholesale 等）。
 /// ponytail: 固定值；遇到 DOM 就绪后还要很久才渲染正文的站，调大它或让 agent 用 wait 等
@@ -1733,7 +1776,12 @@ fn wait_loaded(browser: &mut Browser, session: &str, timeout_ms: u64) -> Result<
         {
             return Ok(true);
         }
-        match eval_value(browser, session, "document.readyState")?.as_str() {
+        // 跳转途中执行脚本会报"execution context destroyed"，当作还没就绪接着轮询，
+        // 不能让这个临时错误把 open、back、reload 整条命令带失败
+        match eval_value(browser, session, "document.readyState")
+            .unwrap_or(Value::Null)
+            .as_str()
+        {
             Some("complete") => return Ok(true),
             Some("interactive") if grace_deadline.is_none() => {
                 grace_deadline = Some(Instant::now() + LOAD_GRACE);
@@ -2124,6 +2172,29 @@ mod tests {
         ];
         assert_eq!(jpeg_dimensions(&bytes).unwrap(), (800, 600));
         assert!(jpeg_dimensions(b"\x89PNG").is_err());
+    }
+
+    #[test]
+    fn reports_thrown_values() {
+        // throw new Error(...)：内容在 exception.description 里，带调用栈，只取第一行
+        let thrown_error = json!({"exceptionDetails": {
+            "text": "Uncaught",
+            "exception": {"description": "Error: 目标不可见\n    at <anonymous>:1:1"}
+        }});
+        assert_eq!(
+            check_exception(&thrown_error).unwrap_err().to_string(),
+            "目标不可见"
+        );
+        // throw '文字'：抛的不是 Error 对象，没有 description，内容在 exception.value 里
+        let thrown_string = json!({"exceptionDetails": {
+            "text": "Uncaught",
+            "exception": {"type": "string", "value": "没有库存"}
+        }});
+        assert_eq!(
+            check_exception(&thrown_string).unwrap_err().to_string(),
+            "没有库存"
+        );
+        assert!(check_exception(&json!({"result": {"value": 1}})).is_ok());
     }
 
     #[test]

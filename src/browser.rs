@@ -15,7 +15,6 @@ use std::{
 pub struct SessionState {
     pub endpoint: String,
     pub launched: bool,
-    pub pid: Option<u32>,
     pub current_target: Option<String>,
     /// 标签页首次出现的先后顺序，`tabs` 的序号按它排
     #[serde(default)]
@@ -36,13 +35,10 @@ impl Browser {
         let home = data_home()?;
         let state_path = home.join("sessions").join(format!("{session_name}.json"));
         let mut state = if let Some(cdp) = supplied_cdp {
-            SessionState {
-                endpoint: normalize_endpoint(cdp)?,
-                launched: false,
-                pid: None,
-                current_target: None,
-                tab_order: Vec::new(),
-            }
+            let stored = fs::read_to_string(&state_path)
+                .ok()
+                .and_then(|text| serde_json::from_str::<SessionState>(&text).ok());
+            state_for_cdp(stored, normalize_endpoint(cdp)?)
         } else if let Ok(text) = fs::read_to_string(&state_path) {
             serde_json::from_str(&text).context("会话状态文件格式错误")?
         } else {
@@ -167,23 +163,23 @@ impl Browser {
         // 多个通道按 concurrency.md 用 `--cdp … tab new` 初始化时，连接时先建的空白页马上被 tab new 替下，
         // 没人再用，每轮都剩下几个（2026-09-19 七个通道收尾后剩 2 个）
         if !exists {
-            self.state.current_target = self.free_page(None)?;
+            self.state.current_target = self.free_page(&pages, None);
         }
         Ok(())
     }
 
-    /// 找一个能当当前页的标签页：跳过 `exclude`（刚关掉、还在列表里残留的页）和同一个 Chrome 上
-    /// 其他会话的当前页，找不到返回 None，不新建。
+    /// 从已取到的标签页列表里找一个能当当前页的：跳过 `exclude`（刚关掉、还在列表里残留的页）和
+    /// 同一个 Chrome 上其他会话的当前页，找不到返回 None，不新建。
     /// 多个会话共用一个 Chrome 时，直接取第一个标签页会选中别的会话正在用的页，之后的 open 会把它导航走。
     /// 只有一个会话时没有要跳过的页，第一次连上照旧接管用户已经打开的标签页。
-    pub fn free_page(&mut self, exclude: Option<&str>) -> Result<Option<String>> {
+    pub fn free_page(&self, pages: &[Value], exclude: Option<&str>) -> Option<String> {
         let taken = self.other_sessions_targets();
-        Ok(self.page_targets()?.into_iter().find_map(|page| {
+        pages.iter().find_map(|page| {
             page["targetId"]
                 .as_str()
                 .filter(|id| Some(*id) != exclude && !taken.iter().any(|other| other == id))
                 .map(str::to_owned)
-        }))
+        })
     }
 
     pub fn new_blank(&mut self) -> Result<String> {
@@ -214,6 +210,21 @@ impl Browser {
             .filter(|state| state.endpoint == self.state.endpoint)
             .filter_map(|state| state.current_target)
             .collect()
+    }
+}
+
+/// `--cdp` 指的就是状态文件里那个浏览器时沿用已有状态：当前页和标签页顺序不丢，
+/// `launched` 也不会被改成 false（改成 false 后 `close` 就不再关闭 webctl 自己启动的 Chrome）。
+/// 状态文件读不出来、或者指向另一个浏览器时新建一份，不报错。
+fn state_for_cdp(stored: Option<SessionState>, endpoint: String) -> SessionState {
+    match stored {
+        Some(stored) if stored.endpoint == endpoint => stored,
+        _ => SessionState {
+            endpoint,
+            launched: false,
+            current_target: None,
+            tab_order: Vec::new(),
+        },
     }
 }
 
@@ -271,7 +282,8 @@ fn endpoint_ws(endpoint: &str) -> Result<String> {
     if endpoint.starts_with("ws://") {
         return Ok(endpoint.to_owned());
     }
-    let version = http_json(endpoint, "/json/version", Duration::from_secs(1))?;
+    // 超时和 Cdp::connect 一致：机器忙的时候 1 秒判不完，活着的浏览器会被当成连不上、白重启一次
+    let version = http_json(endpoint, "/json/version", Duration::from_secs(3))?;
     version["webSocketDebuggerUrl"]
         .as_str()
         .map(str::to_owned)
@@ -344,13 +356,14 @@ fn launch_chrome(home: &Path, session_name: &str, headless: bool) -> Result<Sess
     let executable = find_chrome().ok_or_else(|| {
         anyhow!("找不到 Chrome 或 Edge；请设置环境变量 WEBCTL_CHROME 指向浏览器可执行文件")
     })?;
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-    let port = listener.local_addr()?.port();
-    drop(listener);
     let profile = home.join("profiles").join(session_name);
     fs::create_dir_all(&profile)?;
+    // 端口交给 Chrome 自己挑（=0），再从配置目录的 DevToolsActivePort 读回来。
+    // 自己先 bind 一个端口拿号再放掉，Chrome 启动慢或两条命令同时首启时会撞号：
+    // 端口一直不开，命令失败也不写状态文件，Chrome 却活着占住配置目录，
+    // 之后每条命令都重新启动，新进程把请求转交给它就退出，端口永远等不到
     let mut args = vec![
-        format!("--remote-debugging-port={port}"),
+        "--remote-debugging-port=0".to_owned(),
         format!("--user-data-dir={}", profile.display()),
         "--no-first-run".to_owned(),
         "--no-default-browser-check".to_owned(),
@@ -359,15 +372,22 @@ fn launch_chrome(home: &Path, session_name: &str, headless: bool) -> Result<Sess
     if headless {
         args.push("--headless=new".to_owned());
     }
-    let pid = spawn_browser(&executable, &args)?;
-    let endpoint = format!("http://127.0.0.1:{port}");
+    spawn_browser(&executable, &args)?;
+    // 启动前不删 DevToolsActivePort：同一配置目录已经有 Chrome 在跑时，新进程把请求转交给它后退出，
+    // 这时文件里是那个实例的端口，照样能接上。文件是上次崩溃留下的旧端口时连不通，接着轮询等它被覆盖
+    let port_file = profile.join("DevToolsActivePort");
     let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
-        if endpoint_ws(&endpoint).is_ok() {
+        // 文件第一行就是调试端口
+        if let Some(endpoint) = fs::read_to_string(&port_file)
+            .ok()
+            .and_then(|text| text.lines().next()?.trim().parse::<u16>().ok())
+            .map(|port| format!("http://127.0.0.1:{port}"))
+            && endpoint_ws(&endpoint).is_ok()
+        {
             return Ok(SessionState {
                 endpoint,
                 launched: true,
-                pid: Some(pid),
                 current_target: None,
                 tab_order: Vec::new(),
             });
@@ -388,10 +408,16 @@ fn find_chrome() -> Option<PathBuf> {
     let mut candidates = Vec::new();
     #[cfg(windows)]
     {
-        for variable in ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"] {
-            if let Some(base) = env::var_os(variable).map(PathBuf::from) {
-                candidates.push(base.join("Google/Chrome/Application/chrome.exe"));
-                candidates.push(base.join("Microsoft/Edge/Application/msedge.exe"));
+        // 先找完所有位置的 Chrome，再找 Edge：装了 Edge 的机器上 Chrome 在 %LOCALAPPDATA% 时
+        // 按目录逐个找会先命中 %ProgramFiles% 里的 Edge
+        for program in [
+            "Google/Chrome/Application/chrome.exe",
+            "Microsoft/Edge/Application/msedge.exe",
+        ] {
+            for variable in ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"] {
+                if let Some(base) = env::var_os(variable).map(PathBuf::from) {
+                    candidates.push(base.join(program));
+                }
             }
         }
     }
@@ -597,8 +623,32 @@ fn quote_windows_arg(arg: &str) -> String {
 
 #[cfg(all(test, windows))]
 mod tests {
-    use super::{order_pages, quote_windows_arg};
+    use super::{SessionState, order_pages, quote_windows_arg, state_for_cdp};
     use serde_json::json;
+
+    #[test]
+    fn keeps_state_for_same_cdp_endpoint() {
+        let stored = SessionState {
+            endpoint: "http://127.0.0.1:9333".to_owned(),
+            launched: true,
+            current_target: Some("A1".to_owned()),
+            tab_order: vec!["A1".to_owned()],
+        };
+        // 同一个浏览器：当前页、标签页顺序、launched 都留着
+        let same = state_for_cdp(Some(stored.clone()), "http://127.0.0.1:9333".to_owned());
+        assert_eq!(same.current_target.as_deref(), Some("A1"));
+        assert_eq!(same.tab_order, ["A1"]);
+        assert!(same.launched);
+        // 换了地址、或者没有状态文件：新建一份
+        let other = state_for_cdp(Some(stored), "http://127.0.0.1:9444".to_owned());
+        assert_eq!(other.endpoint, "http://127.0.0.1:9444");
+        assert_eq!(other.current_target, None);
+        assert!(!other.launched);
+        assert_eq!(
+            state_for_cdp(None, "http://127.0.0.1:9333".to_owned()).current_target,
+            None
+        );
+    }
 
     #[test]
     fn tab_order_survives_activation_and_close() {

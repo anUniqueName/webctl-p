@@ -42,9 +42,9 @@ description: 用命令行操作 Chrome 浏览器。需要打开网页、读取�
 | `scroll up\|down\|top\|bottom [像素] [--in 目标]` | 滚动页面或某个区域 |
 | `eval JS` / `eval --file 路径` `[--max N]` | 执行 JS 并返回结果；可以写 `return`、`await`，同一页面上多次 eval 可以重复声明同名 `const`，和页面自己的全局变量重名也不报错，不用包成 `(() => {...})()`；结果超过 `--max`（默认 20000 字）截成字符串，输出带 `truncated`、`length`，这时不能当 JSON 解析，加大 `--max` 重跑 |
 | `screenshot [路径] [--full] [--annotate]` | 截图（会先把当前标签页切到前台）；路径是位置参数，直接写在后面，没有 `--path`；`--annotate` 在图上标出元素编号；路径写 `.jpg` 存成 JPEG，体积小，适合当证据。返回里有截图时的 `url`、`title`、`taken_at`（本地时间），可以核对拍到的是不是要的页面；文件已存在时照样覆盖，返回 `"overwrote": true` |
-| `wait [--selector CSS] [--gone CSS] [--text 文字] [--url 片段] [--ms N] [--timeout 毫秒]` | 等待条件全部满足；`--selector` 等元素出现且可见，`script`、`style` 这类不渲染的元素按存在算（可以等 `#__NEXT_DATA__`） |
+| `wait [--selector CSS] [--gone CSS] [--text 文字] [--url 片段] [--ms N] [--timeout 毫秒]` | 等待条件全部满足；`--selector` 等元素出现且可见（判定和 `click` 一致，还在淡入、`opacity: 0` 的不算可见），`script`、`style` 这类不渲染的元素按存在算（可以等 `#__NEXT_DATA__`） |
 | `find 模板图 [--threshold 0.8] [--max N]` | 视觉识别：在页面截图里找模板图片（PNG/JPEG/WebP），返回匹配中心坐标和相似度 |
-| `vclick 模板图 [--threshold 0.8]` | 找到模板图位置并以拟人轨迹移动点击；找不到就报错，不盲点 |
+| `vclick 模板图 [--threshold 0.8] [--right] [--double]` | 找到模板图位置并以拟人轨迹移动点击；找不到就报错，不盲点 |
 | `gap 背景图 [--piece 滑块图] [--max N]` | 滑块验证码：在背景图（PNG/JPEG/WebP）里找缺口位置，纯本地计算不需要浏览器 |
 | `move X Y` / `clickat X Y [--right] [--double] [--hold 毫秒]` | 拟人轨迹移动 / 点击视口坐标，不经过 DOM 定位，可点 canvas、封闭 shadow root；`--hold` 是长按，按下保持指定毫秒再松开 |
 | `drag X1 Y1 X2 Y2 [--duration 毫秒]` | 按住左键从起点拖到终点（拟人轨迹，默认用 800ms），用于滑块、拖拽排序 |
@@ -53,6 +53,7 @@ description: 用命令行操作 Chrome 浏览器。需要打开网页、读取�
 | `turnstile [--timeout 毫秒]` | 先切到前台，量出验证控件位置，用真实鼠标事件点一下勾选框；控件不可见时如实报出，不重试 |
 | `front` | 把浏览器窗口切到前台 |
 | `status` / `close` | 查看会话 / 关闭浏览器 |
+| `--settle 毫秒` / `--timeout 毫秒` | 会改变页面的命令都能加（`click`、`clickat`、`vclick`、`hover`、`fill`、`type`、`press`、`select`、`drag`）：操作后等页面稳定再报变化，`--settle` 是这段等待的上限（默认 3000，页面连续 300 毫秒不变就提前结束）；期间发生跳转就改等加载完成，上限是 `--timeout`（默认 30000） |
 
 全局参数：`--session 名字`（多个互相独立的浏览器）、`--headless`（无界面，只在启动浏览器时生效）、`--cdp 端口`（连接已开调试端口的浏览器）、`--on-dialog accept|dismiss`、`--prompt-text 文字`。
 
@@ -78,9 +79,7 @@ webctl click e7 --on-dialog accept   # 确认删除
 
 ## 点了没反应怎么判断
 
-`click` 发的是浏览器输入层的真实鼠标事件（页面上监听到的 `mousemove → mousedown → mouseup → click` 四个事件 `isTrusted` 都是 `true`），不是 JS 合成的 `el.click()`。所以**返回里没有 `changes` 不等于点击没生效**，多半是表单提交或跳转比默认等待时间长，webctl 先返回了。
-
-按这个顺序排查，不要一上来就改用 `eval` 里 `el.click()` 绕过去：
+`click` 发的是浏览器输入层的真实鼠标事件（页面上监听到的 `mousemove → mousedown → mouseup → click` 四个事件 `isTrusted` 都是 `true`），不是 JS 合成的 `el.click()`。所以**返回里没有 `changes` 不等于点击没生效**，多半是表单提交或跳转比默认等待时间长，webctl 先返回了。按这个顺序排查，不要一上来就改用 `eval` 里 `el.click()` 绕过去：
 
 1. `webctl click e3 --settle 6000` 把等待加长重试；
 2. 或者点完立刻用 `webctl wait --url 目标地址片段 --timeout 10000` 等确切条件；
@@ -114,23 +113,13 @@ webctl wait --text "目标页上的文字" --timeout 300000            # 等目�
 
 别用 `wait --gone "#challenge-form"` 等：有的验证页只靠标题认出来，页面上本来就没有这个元素，会立刻返回。
 
-验证页上有可见控件时，可以先试 `webctl turnstile`：先把标签页切到前台，量出控件在页面上的位置（最少量 3 秒，`--timeout` 更长就多量，最多 10 秒），用和真人一样的真实鼠标事件点一下勾选框的位置，再等验证消失。这是显式命令，`open` 不会自动去点。
-
-```sh
-webctl turnstile   # {"challenge":"widget_visible","measured_from":"container","clicked":true,"passed":true}
-```
-
-`measured_from` 说明位置是从哪量的：`iframe` 是控件就是页面里的 iframe；`container` 是控件内部在封闭 shadow root 里够不着，退回用容器的位置——真实 Turnstile 基本都是后者。整页验证的主文档里常常只有一个 0×0 的隐藏字段 `cf-chl-widget-xxx_response`，这时量的是它的父元素（挂封闭 shadow root 的容器）。
-
-判断只到"控件可不可见"为止，到不了"能不能点"：控件内部谁也进不去。所以：
+验证页上有可见控件时，可以先试 `webctl turnstile`（显式命令，`open` 不会自动去点）：先把标签页切到前台，量出控件位置（最少量 3 秒，`--timeout` 更长就多量，最多 10 秒），用和真人一样的真实鼠标事件点一下勾选框，再等验证消失。输出形如 `{"challenge":"widget_visible","measured_from":"container","clicked":true,"passed":true}`。`measured_from` 说明位置是从哪量的：`iframe` 是控件本身就是页面里的 iframe，`container` 是控件内部在封闭 shadow root 里够不着、退回用容器的位置（真实 Turnstile 基本都是后者；整页验证的主文档里常常只有一个 0×0 的隐藏字段 `cf-chl-widget-xxx_response`，这时量的是它的父元素）。判断只到"控件可不可见"为止，到不了"能不能点"——控件内部谁也进不去，所以：
 
 - `"passed":true` —— 点完验证消失了，继续干活。
 - `"passed":false` —— 点过了但验证还在，说明这个控件不是点一下能过的，**别重试**，按调用方的规定交人工或记为拦截。
 - `"challenge":"widget_hidden"` —— 量了 3 秒以上都没量到可见控件。先 `screenshot` 看一眼：看得到勾选框时，按调用方的规定决定是否用 `clickat` 点它；看不到就是非交互式验证，放不放行取决于浏览器环境和出口 IP，交人工或记为拦截。
 
-过一次之后验证 cookie 存在该会话的配置目录里，之后一段时间（通常几小时到几天）同一个 session 访问不会再拦，所以这一步不是每次跑都要。
-
-被网站挡住时先想 cookie，别归咎于"自动化被识别"。webctl 用的是自己的 Chrome 配置目录，新建的目录一条 cookie 都没有，亚马逊这类站点对全新访客本来就会拦。让用户手动登录一次，配置目录攒上 cookie，后面就正常了。webctl 不改浏览器指纹，也不需要——真实输入事件本身没有自动化标记。
+被网站挡住时先想 cookie，别归咎于"自动化被识别"。过一次之后验证 cookie 存在该会话的配置目录里，之后一段时间（通常几小时到几天）同一个 session 访问不会再拦，所以这一步不是每次跑都要；反过来，新建的配置目录一条 cookie 都没有，亚马逊这类站点对全新访客本来就会拦，让用户手动登录一次、攒上 cookie 后面就正常了。webctl 不改浏览器指纹，也不需要——真实输入事件本身没有自动化标记。
 
 ## 注意
 
@@ -140,6 +129,7 @@ webctl turnstile   # {"challenge":"widget_visible","measured_from":"container","
 - 图标按钮、canvas 这类看不出含义的元素，用 `screenshot --annotate` 截图对照编号。
 - 跨域 iframe 里的元素无法编号和操作。
 - 命令报"页面没有响应"时，多半是页面在命令间隙自己弹了对话框：`webctl front` 后请用户手动关闭。
+- 密码用 `fill` 填进 `input[type=password]`，日志里那段文字会记成 `***`；别把密码写进 `eval` 的脚本，脚本是原样记录的。
 
 ## 视觉识别定位
 
@@ -165,6 +155,4 @@ webctl gap bg.png --piece piece.png
 webctl drag <滑块把手x> <滑块把手y> <把手x + 缺口x*显示比例> <把手y>
 ```
 
-原理：缺口是一块被压暗、边缘带亮边的区域。`gap` 算每个像素相对大窗口局部均值的变暗量，在多个阈值下取连通域，跨阈值稳定、暗得明显、尺寸和滑块相当的候选排前面；给了 `--piece` 还会算连通域和滑块形状（alpha 通道）的 IoU。多缺口干扰时几个候选都会返回，第一个拖不过就试下一个（验证码本身允许重试）。
-
-注意：背景图要用**页面上实际显示的那张**（`eval` 取 `img.currentSrc` 下载，或对元素截图），别用打乱的原始切片图；图和滑块要同一缩放比例。坐标是图片像素，乘 `显示宽度/图片宽度` 换算成拖动距离。`gap` 只给坐标，拖不拖、拖到哪个候选、过没过由你判断。
+原理：缺口是一块被压暗、边缘带亮边的区域。`gap` 算每个像素相对大窗口局部均值的变暗量，在多个阈值下取连通域，跨阈值稳定、暗得明显、尺寸和滑块相当的候选排前面；给了 `--piece` 还会算连通域和滑块形状（alpha 通道）的 IoU。多缺口干扰时几个候选都会返回，第一个拖不过就试下一个（验证码本身允许重试）。注意：背景图要用**页面上实际显示的那张**（`eval` 取 `img.currentSrc` 下载，或对元素截图），别用打乱的原始切片图；图和滑块要同一缩放比例。坐标是图片像素，乘 `显示宽度/图片宽度` 换算成拖动距离。`gap` 只给坐标，拖不拖、拖到哪个候选、过没过由你判断。

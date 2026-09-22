@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use browser::Browser;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use serde_json::{Value, json};
-use std::{fs, path::PathBuf, time::Instant};
+use std::{fs, io::Write, path::PathBuf, time::Instant};
 
 #[derive(Parser)]
 #[command(
@@ -281,13 +281,15 @@ enum Output {
 }
 
 fn main() {
+    let started = Instant::now();
+    let argv: Vec<String> = std::env::args().skip(1).collect();
     // 先取 matches 是为了拿到子命令名写进日志，再照常解析成 Cli
-    let matches = Cli::command().get_matches();
+    let matches = Cli::command()
+        .try_get_matches()
+        .unwrap_or_else(|error| exit_on_parse_error(error, &argv, started));
     let command_name = matches.subcommand_name().unwrap_or("?").to_owned();
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
     let session = session_name(cli.session.clone());
-    let argv: Vec<String> = std::env::args().skip(1).collect();
-    let started = Instant::now();
 
     let result = run(cli, &session);
     let (ok, error) = match &result {
@@ -298,6 +300,16 @@ fn main() {
         ),
         Ok(Output::Text(_)) => (true, None),
         Err(error) => (false, Some(format!("{error:#}"))),
+    };
+    // 密码不进日志：命令标了 masked 时，把 argv 里的那段文字换掉再记。
+    // fill、type 失败时（目标不可见、已禁用、焦点被转走、连不上浏览器）还判断不出目标是不是密码框，
+    // 一律按密码处理：失败要看的是目标和原因，不是填进去的文字
+    let masked = matches!(&result, Ok(Output::Json(value)) if value["masked"] == true)
+        || (!ok && matches!(command_name.as_str(), "fill" | "type"));
+    let argv = if masked {
+        mask_secret(argv, &matches, &command_name)
+    } else {
+        argv
     };
     log::record(log::Record {
         session: &session,
@@ -317,18 +329,79 @@ fn main() {
     if !ok {
         eprintln!("webctl: {}", error.as_deref().unwrap_or("命令失败"));
     }
+    // 不用 println!：`webctl text | head` 这类用法里读的一方先退出，管道断了 println! 会 panic，
+    // 退出码变成 101。写不出去就算了，退出码照旧
+    let mut stdout = std::io::stdout();
     match result {
         Ok(Output::Json(value)) if value["ok"] == false => {
-            println!("{value}");
+            let _ = writeln!(stdout, "{value}");
             std::process::exit(1);
         }
-        Ok(Output::Json(value)) => println!("{value}"),
-        Ok(Output::Text(text)) => println!("{text}"),
+        Ok(Output::Json(value)) => {
+            let _ = writeln!(stdout, "{value}");
+        }
+        Ok(Output::Text(text)) => {
+            let _ = writeln!(stdout, "{text}");
+        }
         Err(error) => {
-            println!("{}", json!({"ok": false, "error": format!("{error:#}")}));
+            let _ = writeln!(
+                stdout,
+                "{}",
+                json!({"ok": false, "error": format!("{error:#}")})
+            );
             std::process::exit(1);
         }
     }
+}
+
+/// 命令行解析失败也记一行日志：clap 解析不过就直接结束进程，下面的 log::record 根本轮不到跑，
+/// agent 写错的调用（最该拿来改 SKILL.md 的信号）一点痕迹都不留。
+/// `--help`、`--version` 是正常输出，不记。记完照旧交给 clap 打印并退出，输出和退出码都不变。
+/// 参数没解析出来，子命令名只能从 argv 里认，`--session` 也读不到，会话名按环境变量和默认值取
+fn exit_on_parse_error(error: clap::Error, argv: &[String], started: Instant) -> ! {
+    use clap::error::ErrorKind;
+    if !matches!(
+        error.kind(),
+        ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+    ) {
+        let definition = Cli::command();
+        let command = definition
+            .get_subcommands()
+            .map(clap::Command::get_name)
+            .find(|name| argv.iter().any(|arg| arg == name))
+            .unwrap_or("?");
+        let message = error.to_string();
+        log::record(log::Record {
+            session: &session_name(None),
+            command,
+            argv,
+            ok: false,
+            error: Some(message.lines().next().unwrap_or("命令行参数有误")),
+            elapsed: started.elapsed(),
+            output: None,
+        });
+    }
+    error.exit()
+}
+
+/// 把 argv 里 fill、type 的 TEXT 位置参数换成 `***`。argv 是原样记下来的命令行，
+/// 不换的话密码会留在日志库里，而这个库现在要被拷到别处分析
+fn mask_secret(argv: Vec<String>, matches: &clap::ArgMatches, command: &str) -> Vec<String> {
+    let Some(secret) = matches
+        .subcommand_matches(command)
+        .and_then(|sub| sub.get_one::<String>("text"))
+    else {
+        return argv;
+    };
+    argv.into_iter()
+        .map(|arg| {
+            if &arg == secret {
+                "***".to_owned()
+            } else {
+                arg
+            }
+        })
+        .collect()
 }
 
 fn session_name(flag: Option<String>) -> String {

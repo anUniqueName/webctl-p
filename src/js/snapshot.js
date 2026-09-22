@@ -16,9 +16,9 @@
     }
   };
   visit(document);
-  const visible = el => {
+  // style 由调用方传入时不再解析一遍：下面筛选元素时每个元素只算一次 computed style
+  const visible = (el, style = getComputedStyle(el)) => {
     const rect = el.getBoundingClientRect();
-    const style = getComputedStyle(el);
     if (rect.width <= 0 || rect.height <= 0 || style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) <= 0) return false;
     for (let node = el; node; node = node.parentElement) if (node.getAttribute?.('aria-hidden') === 'true') return false;
     return true;
@@ -29,7 +29,8 @@
     // 和其他命令一样：选择器命中多个时先取第一个可见的
     if (!ref) {
       const all = [...document.querySelectorAll(target)];
-      return all.find(visible) || all[0] || null;
+      // 不能直接写 all.find(visible)：find 会把下标当成第二个参数传进去
+      return all.find(el => visible(el)) || all[0] || null;
     }
     for (const root of roots) {
       const found = root.querySelector(`[data-webctl-ref="${ref}"]`);
@@ -64,8 +65,9 @@
         const role = el.getAttribute('role');
         const native = (tag === 'a' && el.hasAttribute('href')) || tag === 'button' || (tag === 'input' && el.type !== 'hidden') || ['textarea','select','summary'].includes(tag) || (el.hasAttribute('contenteditable') && ['','true'].includes(el.getAttribute('contenteditable')));
         const tabindex = el.hasAttribute('tabindex') && Number(el.getAttribute('tabindex')) >= 0;
-        const pointer = getComputedStyle(el).cursor === 'pointer' && !selected.some(parent => parent.contains(el));
-        if ((native || roleNames.has(role) || tabindex || pointer) && visible(el)) selected.push(el);
+        const style = getComputedStyle(el);
+        const pointer = style.cursor === 'pointer' && !selected.some(parent => parent.contains(el));
+        if ((native || roleNames.has(role) || tabindex || pointer) && visible(el, style)) selected.push(el);
       } catch (_) {
         skipped++;
       }

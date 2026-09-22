@@ -59,8 +59,11 @@ impl Cdp {
         timeout: Duration,
     ) -> Result<Value> {
         let id = self.send(method, params, session.map(|session| json!(session)))?;
-        self.set_read_timeout(timeout)?;
+        // 和 wait_event 一样按绝对时限算：读超时设一次的话，每收到一个无关事件都等于重新给满一个
+        // 超时窗口，事件不断的页面上这条命令永远等不到超时
+        let deadline = Instant::now() + timeout;
         loop {
+            self.set_read_timeout(deadline.saturating_duration_since(Instant::now()))?;
             let message = match self.socket.read() {
                 Ok(message) => message,
                 Err(tungstenite::Error::Io(error)) if is_timeout(&error) => bail!(

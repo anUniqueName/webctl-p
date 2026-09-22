@@ -20,7 +20,11 @@ jobs:
         shell: bash
         run: grep -q "^version = \"${GITHUB_REF_NAME#v}\"" Cargo.toml || { echo "标签 $GITHUB_REF_NAME 和 Cargo.toml 的 version 不一致"; exit 1; }
 
-      # smoke 测试用无头 Chrome，runner 上装了 Chrome
+      # smoke 测试找不到 Chrome 时会跳过并照常通过，runner 上的 Chrome 没了就等于没测过就发版
+      - name: runner 上有 Chrome
+        shell: bash
+        run: test -f "/c/Program Files/Google/Chrome/Application/chrome.exe" || { echo "runner 上没有 Chrome，chrome_smoke 会被跳过，不能就这样发版"; exit 1; }
+
       - name: 测试
         run: cargo test --locked
 

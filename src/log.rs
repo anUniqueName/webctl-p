@@ -21,18 +21,24 @@ const SCHEMA: &str = "
         added_count INTEGER,
         new_tabs    INTEGER,
         run_id      TEXT,
-        url         TEXT
+        url         TEXT,
+        version     TEXT,
+        hint        TEXT,
+        loaded      INTEGER
     );
 ";
 
 /// 老库补列。已经有这列时 ALTER 会报错，忽略即可。
 /// ponytail: 每条命令都跑一遍这几条 ALTER，列多了再换 PRAGMA user_version 做版本号
-const ADDED_COLUMNS: [&str; 5] = [
+const ADDED_COLUMNS: [&str; 8] = [
     "navigated INTEGER",
     "added_count INTEGER",
     "new_tabs INTEGER",
     "run_id TEXT",
     "url TEXT",
+    "version TEXT",
+    "hint TEXT",
+    "loaded INTEGER",
 ];
 
 pub struct Record<'a> {
@@ -72,9 +78,14 @@ fn write(entry: Record<'_>) -> Result<()> {
             .as_str()
             .or_else(|| output["changes"]["url"].as_str())
     });
+    // 给 agent 的提示也记下来：事后能看出它是被警告过还是根本没收到提示。
+    // gap 和 turnstile 用的键名是 note，同样记进 hint 列
+    let hint = entry
+        .output
+        .and_then(|output| output["hint"].as_str().or_else(|| output["note"].as_str()));
     db.execute(
-        "INSERT INTO commands (session, command, argv, ok, ms, error, navigated, added_count, new_tabs, run_id, url)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        "INSERT INTO commands (session, command, argv, ok, ms, error, navigated, added_count, new_tabs, run_id, url, version, hint, loaded)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             entry.session,
             entry.command,
@@ -87,6 +98,9 @@ fn write(entry: Record<'_>) -> Result<()> {
             changes.and_then(|changes| count(&changes["new_tabs"])),
             std::env::var("WEBCTL_RUN_ID").ok(),
             url,
+            env!("CARGO_PKG_VERSION"),
+            hint,
+            entry.output.and_then(|output| output["loaded"].as_bool()),
         ],
     )?;
     Ok(())

@@ -37,6 +37,8 @@
   <div class="blocked-wrap"><button id="blocked">被挡按钮</button><div class="mask"></div></div>
   <label class="export-option"><input id="opt" type="checkbox"><div class="export-option__title">可售天数显示</div></label>
   <div class="blocked-wrap"><button id="fading">淡出后可点</button><div class="mask" id="fading-mask"></div></div>
+  <!-- wait --selector 的可见判定要和 click 一致：这个按钮先 opacity:0，过一会儿才显出来 -->
+  <button id="fade-in" style="opacity:0" onclick="textResult('淡入按钮')">淡入按钮</button>
   <p id="iframe-result"></p>
   <iframe title="同源框架" srcdoc="<button id='inside' onclick=&quot;parent.document.getElementById('iframe-result').textContent='iframe 已点击'&quot;>iframe按钮</button>"></iframe>
   <!-- 选择器命中多个时先取可见的：第一个同名输入框是隐藏的；只有隐藏的 file 输入框时照样能 upload -->
@@ -44,6 +46,12 @@
   <input id="hidden-file" type="file" style="display:none">
   <!-- fill 报错要写明实际原因：焦点被页面转走、输入框已禁用 -->
   <input id="redir" onfocus="document.getElementById('real').focus()"><input id="real"><input id="off" disabled>
+  <!-- 密码框：填进去的内容不能原样落进日志 -->
+  <input id="pw" type="password">
+  <!-- 填完之后目标的文字就变了：fill 不能靠重新定位目标来读回填好的值 -->
+  <label id="live-label">计数 0<input id="live" oninput="this.parentElement.firstChild.data = '计数 ' + this.value.length"></label>
+  <!-- 开放 shadow root 里的按钮：遮挡检查要在元素自己的根里取命中元素，用文档取到的是宿主 -->
+  <div id="shadow-host"></div>
   <!-- 拦截页的脚本会改写 DOM 属性：一个元素的 tagName 是 undefined，另一个一读 localName 就抛错 -->
   <span id="odd-tag" style="cursor:pointer">改过标签名</span>
   <span id="broken" style="cursor:pointer">读取出错的元素</span>
@@ -88,6 +96,8 @@
     Object.defineProperty(document.querySelector('#odd-tag'), 'tagName', {get: () => undefined});
     Object.defineProperty(document.querySelector('#broken'), 'localName', {get() { throw new Error('页面改坏的属性'); }});
     const textResult = text => { document.querySelector('#text-result').textContent = text; };
+    document.querySelector('#shadow-host').attachShadow({mode: 'open'}).innerHTML =
+      '<button onclick="textResult(\'影子按钮\')">影子按钮</button>';
     document.querySelector('#flash').onclick = () => {
       const toast = document.createElement('div');
       toast.id = 'toast'; toast.textContent = '保存成功'; document.body.appendChild(toast);

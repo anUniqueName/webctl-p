@@ -115,6 +115,96 @@ fn logs_commands_to_sqlite() {
         .query_row("SELECT count(*) FROM commands", [], |row| row.get(0))
         .unwrap();
     assert_eq!(count, 2, "WEBCTL_LOG=0 时不应写入");
+
+    // 每行都记下产生它的 webctl 版本：收集来的日志跨多个版本，没有它对不上是哪个构建
+    let versions: Vec<Option<String>> = db
+        .prepare("SELECT version FROM commands ORDER BY id")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(
+        versions
+            .iter()
+            .all(|version| version.as_deref() == Some(env!("CARGO_PKG_VERSION"))),
+        "version 列应填当前版本：{versions:?}"
+    );
+
+    // 命令行写错也要留下记录：clap 解析不过时进程直接结束，之前一行都不记
+    let bad = Command::new(env!("CARGO_BIN_EXE_webctl"))
+        .args(["--session", "smoke", "status", "--nope"])
+        .env("WEBCTL_HOME", &home)
+        .output()
+        .expect("无法执行 webctl");
+    assert_eq!(bad.status.code(), Some(2), "退出码照旧是 2");
+    let bad_stderr = String::from_utf8_lossy(&bad.stderr).into_owned();
+    assert!(
+        bad_stderr.contains("--nope"),
+        "clap 的报错照旧写 stderr：{bad_stderr}"
+    );
+    let (bad_command, bad_ok, bad_error): (String, bool, Option<String>) = db
+        .query_row(
+            "SELECT command, ok, error FROM commands ORDER BY id DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(bad_command, "status", "子命令名要从 argv 里认出来");
+    assert!(!bad_ok, "命令行写错应记为失败");
+    assert!(
+        bad_error
+            .as_deref()
+            .is_some_and(|e| e.contains("--nope") && !e.contains('\u{1b}')),
+        "应记下 clap 的报错，且不带终端配色的转义字符：{bad_error:?}"
+    );
+
+    // --help 是正常输出，不记
+    Command::new(env!("CARGO_BIN_EXE_webctl"))
+        .arg("--help")
+        .env("WEBCTL_HOME", &home)
+        .output()
+        .expect("无法执行 webctl");
+    let count: i64 = db
+        .query_row("SELECT count(*) FROM commands", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 3, "--help 不该记一行失败");
+
+    // fill 失败时还判断不出目标是不是密码框，文字一律记成 ***（这里连不上端口，失败得更早）
+    let failed_fill = Command::new(env!("CARGO_BIN_EXE_webctl"))
+        .args([
+            "--session",
+            "smoke",
+            "--headless",
+            "fill",
+            "#nope",
+            "some-secret-text",
+            "--cdp",
+            "1",
+        ])
+        .env("WEBCTL_HOME", &home)
+        .output()
+        .expect("无法执行 webctl");
+    assert!(!failed_fill.status.success(), "连不上的端口应该报错");
+    let fill_argv: String = db
+        .query_row(
+            "SELECT argv FROM commands WHERE command = 'fill' ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        fill_argv.contains("***") && fill_argv.contains("#nope"),
+        "失败的 fill 应遮住文字、留下目标：{fill_argv}"
+    );
+    let leaked: i64 = db
+        .query_row(
+            "SELECT count(*) FROM commands WHERE argv LIKE '%some-secret-text%' OR ifnull(error, '') LIKE '%some-secret-text%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(leaked, 0, "整张表里都不该出现填进去的文字");
 }
 
 #[test]
@@ -254,6 +344,38 @@ fn chrome_smoke() {
         started.elapsed()
     );
 
+    // wait --selector 的可见判定要和 click 一致：元素还是 opacity:0 时不能放行，
+    // 否则 wait 刚返回、click 就报"不可见"
+    ok(
+        &home,
+        &[
+            "eval",
+            "setTimeout(() => document.querySelector('#fade-in').style.opacity = '1', 600); return 'armed'",
+        ],
+    );
+    let started = std::time::Instant::now();
+    assert_eq!(
+        json(
+            &home,
+            &["wait", "--selector", "#fade-in", "--timeout", "5000"]
+        )["ok"],
+        true
+    );
+    assert!(
+        started.elapsed().as_millis() >= 600,
+        "元素还是 opacity:0 时 wait 不该放行：{:?}",
+        started.elapsed()
+    );
+    json(&home, &["click", "#fade-in"]);
+    assert_eq!(
+        json(
+            &home,
+            &["eval", "document.querySelector('#text-result').textContent"]
+        )["result"],
+        "淡入按钮",
+        "wait 返回后应当立刻点得到"
+    );
+
     json(&home, &["press", "Ctrl+A"]);
 
     // 标题文字盖住 checkbox 但同在一个 label 里，点下去照样生效，不算遮挡
@@ -333,6 +455,21 @@ fn chrome_smoke() {
     assert!(disabled.contains("已禁用"), "{disabled}");
     let hidden = String::from_utf8(run(&home, &["fill", "input[style]", "y"]).stdout).unwrap();
     assert!(hidden.contains("不可见"), "{hidden}");
+    // 填完之后目标的文字变了：值要从当前焦点读回，不能重新定位一次目标（那时已经找不到了）
+    assert_eq!(json(&home, &["fill", "text=计数 0", "abc"])["value"], "abc");
+    // 空文字加 --append 什么都不删：之前会发一次 Backspace，把最后一个字删掉
+    assert_eq!(
+        json(&home, &["fill", "#live", "", "--append"])["value"],
+        "abc"
+    );
+
+    // 密码框：stdout 照旧返回真实的 value，只多一个 masked 标记；日志里的 argv 换成 ***
+    let password = json(&home, &["fill", "#pw", "p@ssw0rd-smoke"]);
+    assert_eq!(password["value"], "p@ssw0rd-smoke", "{password}");
+    assert_eq!(password["masked"], true, "{password}");
+    // type 打进密码框同理，看的是当前焦点
+    let typed = json(&home, &["type", "typed-secret-9"]);
+    assert_eq!(typed["masked"], true, "{typed}");
 
     let selected = json(&home, &["select", "#country", "Germany"]);
     assert_eq!(selected["value"], "DE");
@@ -396,6 +533,16 @@ fn chrome_smoke() {
     );
 
     let snapshot = ok(&home, &["snapshot"]);
+    // 开放 shadow root 里的按钮：遮挡检查在元素自己的根里取命中元素，不会把宿主当成遮挡物
+    let shadow_ref = ref_for(&snapshot, "影子按钮");
+    json(&home, &["click", &shadow_ref]);
+    assert_eq!(
+        json(
+            &home,
+            &["eval", "document.querySelector('#text-result').textContent"]
+        )["result"],
+        "影子按钮"
+    );
     let iframe_ref = ref_for(&snapshot, "iframe按钮");
     json(&home, &["click", &iframe_ref]);
     assert_eq!(
@@ -807,6 +954,25 @@ fn chrome_smoke() {
         before,
         "--cdp tab new 再 tab close 后不该多出空白页"
     );
+
+    // 日志里不能留下明文密码：fill、type 的那段文字要换成 ***
+    let db = rusqlite::Connection::open(home.join("webctl.db")).unwrap();
+    let fill_argv: String = db
+        .query_row(
+            "SELECT argv FROM commands WHERE command = 'fill' AND argv LIKE '%#pw%' ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(fill_argv.contains("***"), "密码应换成 ***：{fill_argv}");
+    let leaked: i64 = db
+        .query_row(
+            "SELECT count(*) FROM commands WHERE argv LIKE '%p@ssw0rd-smoke%' OR argv LIKE '%typed-secret-9%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(leaked, 0, "整张表里都不该出现明文密码");
 
     json(&home, &["close"]);
     let status = json(&home, &["status"]);

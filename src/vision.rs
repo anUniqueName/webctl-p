@@ -10,7 +10,6 @@
 use anyhow::{Context, Result};
 
 /// 8bit 灰度图，行优先
-#[derive(Clone)]
 pub struct GrayImage {
     pub width: usize,
     pub height: usize,
@@ -27,35 +26,7 @@ pub struct Match {
 
 /// 解码 PNG 并转成灰度。调色板、16bit、透明通道统一归一到 8bit 灰度。
 pub fn decode_png(bytes: &[u8]) -> Result<GrayImage> {
-    let mut decoder = png::Decoder::new(bytes);
-    // EXPAND 把调色板/低位深展开成 8bit 通道，STRIP_16 把 16bit 砍成 8bit
-    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
-    let mut reader = decoder.read_info().context("无法解析 PNG 头")?;
-    let mut buf = vec![0; reader.output_buffer_size()];
-    let info = reader.next_frame(&mut buf).context("无法解码 PNG 像素")?;
-    let data = &buf[..info.buffer_size()];
-    let (width, height) = (info.width as usize, info.height as usize);
-    let channels = match info.color_type {
-        png::ColorType::Grayscale => 1,
-        png::ColorType::GrayscaleAlpha => 2,
-        png::ColorType::Rgb | png::ColorType::Indexed => 3,
-        png::ColorType::Rgba => 4,
-    };
-    let mut gray = vec![0u8; width * height];
-    for (i, px) in gray.iter_mut().enumerate() {
-        let p = &data[i * channels..i * channels + channels];
-        // Rec.601 亮度
-        *px = if channels <= 2 {
-            p[0]
-        } else {
-            ((p[0] as u32 * 299 + p[1] as u32 * 587 + p[2] as u32 * 114) / 1000) as u8
-        };
-    }
-    Ok(GrayImage {
-        width,
-        height,
-        data: gray,
-    })
+    Ok(decode_png_rgba(bytes)?.gray)
 }
 
 /// 带透明通道的图：灰度 + 可选 alpha。滑块小块用 alpha 抠出形状轮廓。
@@ -98,6 +69,7 @@ pub fn decode_image(bytes: &[u8]) -> Result<Image> {
 /// PNG 解码，比 decode_png 多保留 alpha 通道
 fn decode_png_rgba(bytes: &[u8]) -> Result<Image> {
     let mut decoder = png::Decoder::new(bytes);
+    // EXPAND 把调色板/低位深展开成 8bit 通道，STRIP_16 把 16bit 砍成 8bit
     decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
     let mut reader = decoder.read_info().context("无法解析 PNG 头")?;
     let mut buf = vec![0; reader.output_buffer_size()];
@@ -110,12 +82,16 @@ fn decode_png_rgba(bytes: &[u8]) -> Result<Image> {
         png::ColorType::Rgb | png::ColorType::Indexed => 3,
         png::ColorType::Rgba => 4,
     };
-    let has_alpha = matches!(info.color_type, png::ColorType::GrayscaleAlpha | png::ColorType::Rgba);
+    let has_alpha = matches!(
+        info.color_type,
+        png::ColorType::GrayscaleAlpha | png::ColorType::Rgba
+    );
     let mut gray = vec![0u8; width * height];
     let mut alpha = vec![0u8; width * height];
     let mut any_transparent = false;
     for (i, px) in gray.iter_mut().enumerate() {
         let p = &data[i * channels..i * channels + channels];
+        // Rec.601 亮度
         *px = if channels <= 2 {
             p[0]
         } else {
@@ -165,58 +141,70 @@ pub fn find_gap(bg: &GrayImage, piece: Option<&Image>, max: usize) -> Vec<Gap> {
     }
     // 滑块形状：alpha 抠出非透明部分的包围盒
     let shape = piece.and_then(|p| p.alpha.as_ref().and_then(|a| shape_mask(&p.gray, a)));
-    let (pw, ph) = shape
-        .as_ref()
-        .map(|(w, h, _)| (*w, *h))
-        .unwrap_or((0, 0));
-    // 局部均值的窗口要比缺口还大，缺口内部才会整体显得比周围暗：半径取滑块尺寸的一半
-    let radius = shape
-        .as_ref()
-        .map(|(w, h, _)| (*w).max(*h) / 2)
-        .unwrap_or(16)
-        .clamp(12, 40);
+    let (pw, ph) = shape.as_ref().map(|(w, h, _)| (*w, *h)).unwrap_or((0, 0));
+    // 局部均值的窗口要比缺口还大，缺口内部才会整体显得比周围暗：半径取滑块尺寸的一半。
+    // 上限跟着滑块走：3 倍图的滑块有 144x156，半径卡在 40 就比缺口还小，一个候选都出不来。
+    // 没给滑块图时不知道缺口多大，16、28、40 三个半径各算一遍，结果一起合并：
+    // 固定 16（窗口 33x33）比常见的 48x52 缺口还小，缺口内部显不出整体变暗，只检出破碎的边缘，
+    // 真缺口会被同一块干扰物的几段边缘挤出前 3 名
+    let radii: Vec<usize> = match shape.as_ref() {
+        Some((w, h, _)) => vec![((*w).max(*h) / 2).clamp(12, 120)],
+        None => vec![16, 28, 40],
+    };
     let integral = Integral::new(bg);
     let mut dark = vec![0f32; bg.width * bg.height];
-    for y in 0..bg.height {
-        let y0 = y.saturating_sub(radius);
-        let y1 = (y + radius + 1).min(bg.height);
-        for x in 0..bg.width {
-            let x0 = x.saturating_sub(radius);
-            let x1 = (x + radius + 1).min(bg.width);
-            let (sum, _) = integral.window(x0, y0, x1 - x0, y1 - y0);
-            let mean = sum / ((x1 - x0) * (y1 - y0)) as f64;
-            dark[y * bg.width + x] = (mean - bg.data[y * bg.width + x] as f64).max(0.0) as f32;
-        }
-    }
-
+    // 连通域面积上限也跟着滑块走：缺口再怎么也不会有滑块的两倍大。
+    // 没给滑块图时沿用固定值
+    let max_area = shape.as_ref().map(|(w, h, _)| w * h * 2).unwrap_or(8_000);
     let mut detections: Vec<Detection> = Vec::new();
-    for th in [10.0f32, 15.0, 20.0, 25.0, 30.0] {
-        for comp in components(&dark, bg.width, bg.height, th) {
-            // 缺口尺寸和滑块差不多，太宽太扁的都是背景噪声
-            let (min_w, min_h, max_w, max_h) = if shape.is_some() {
-                (
-                    pw.saturating_sub(25).max(15),
-                    ph.saturating_sub(25).max(15),
-                    pw + 25,
-                    ph + 25,
-                )
-            } else {
-                (20, 20, 130, 130)
-            };
-            if comp.w < min_w || comp.h < min_h || comp.w > max_w || comp.h > max_h {
-                continue;
+    for radius in radii {
+        // 靠边的像素把窗口整体往里挪，不是截短：截短后窗口变小、统计到的范围不够，
+        // 边上缺口的包围盒会被压小（实测 x 差 4、y 差 32）
+        let (win_w, win_h) = (
+            (2 * radius + 1).min(bg.width),
+            (2 * radius + 1).min(bg.height),
+        );
+        for y in 0..bg.height {
+            let y0 = y.saturating_sub(radius).min(bg.height - win_h);
+            for x in 0..bg.width {
+                let x0 = x.saturating_sub(radius).min(bg.width - win_w);
+                let (sum, _) = integral.window(x0, y0, win_w, win_h);
+                let mean = sum / (win_w * win_h) as f64;
+                dark[y * bg.width + x] = (mean - bg.data[y * bg.width + x] as f64).max(0.0) as f32;
             }
-            let darkness = comp.pixels.iter().map(|&i| dark[i as usize] as f64).sum::<f64>()
-                / comp.pixels.len() as f64;
-            let iou = shape
-                .as_ref()
-                .map(|(sw, sh, mask)| shape_iou(&comp, bg.width, *sw, *sh, mask))
-                .unwrap_or(0.0);
-            detections.push(Detection {
-                darkness,
-                iou,
-                ..comp
-            });
+        }
+        for th in [10.0f32, 15.0, 20.0, 25.0, 30.0] {
+            for comp in components(&dark, bg.width, bg.height, th, max_area) {
+                // 缺口尺寸和滑块差不多，太宽太扁的都是背景噪声
+                let (min_w, min_h, max_w, max_h) = if shape.is_some() {
+                    (
+                        pw.saturating_sub(25).max(15),
+                        ph.saturating_sub(25).max(15),
+                        pw + 25,
+                        ph + 25,
+                    )
+                } else {
+                    (20, 20, 130, 130)
+                };
+                if comp.w < min_w || comp.h < min_h || comp.w > max_w || comp.h > max_h {
+                    continue;
+                }
+                let darkness = comp
+                    .pixels
+                    .iter()
+                    .map(|&i| dark[i as usize] as f64)
+                    .sum::<f64>()
+                    / comp.pixels.len() as f64;
+                let iou = shape
+                    .as_ref()
+                    .map(|(sw, sh, mask)| shape_iou(&comp, bg.width, *sw, *sh, mask))
+                    .unwrap_or(0.0);
+                detections.push(Detection {
+                    darkness,
+                    iou,
+                    ..comp
+                });
+            }
         }
     }
     // 按位置合并不同阈值下的同一处检出：稳定性 +1，iou/暗度取最大
@@ -311,7 +299,10 @@ fn shape_iou(comp: &Detection, img_width: usize, sw: usize, sh: usize, shape: &[
     // 连通域掩码标进自己的包围盒
     let mut mask = vec![0u8; comp.w * comp.h];
     for &i in &comp.pixels {
-        let (px, py) = (i as usize % img_width - comp.x, i as usize / img_width - comp.y);
+        let (px, py) = (
+            i as usize % img_width - comp.x,
+            i as usize / img_width - comp.y,
+        );
         mask[py * comp.w + px] = 1;
     }
     // 最近邻采样到滑块形状大小后算 IoU
@@ -331,8 +322,14 @@ fn shape_iou(comp: &Detection, img_width: usize, sw: usize, sh: usize, shape: &[
     }
 }
 
-/// dark > th 的 4 邻接连通域，面积 300..=8000 的才保留
-fn components(dark: &[f32], width: usize, height: usize, th: f32) -> Vec<Detection> {
+/// dark > th 的 4 邻接连通域，面积 300..=max_area 的才保留
+fn components(
+    dark: &[f32],
+    width: usize,
+    height: usize,
+    th: f32,
+    max_area: usize,
+) -> Vec<Detection> {
     let mut visited = vec![false; width * height];
     let mut out = Vec::new();
     for start in 0..width * height {
@@ -353,7 +350,7 @@ fn components(dark: &[f32], width: usize, height: usize, th: f32) -> Vec<Detecti
             y1 = y1.max(y);
             if !too_big {
                 pixels.push(i as u32);
-                if pixels.len() > 8000 {
+                if pixels.len() > max_area {
                     too_big = true;
                 }
             }
@@ -402,33 +399,29 @@ pub fn find(haystack: &GrayImage, template: &GrayImage, threshold: f64, max: usi
 
     // 粗匹配降采样倍数：让粗模板短边约 8px。倍数越大越快，上限 8 防粗模板退化
     let factor = (template.width.min(template.height) / 8).clamp(1, 8);
-    let (coarse_page, coarse_tpl) = if factor > 1 {
-        (downsample(haystack, factor), downsample(template, factor))
-    } else {
-        (haystack.clone(), template.clone())
+    // 倍数为 1（模板短边不到 16px）时不降采样，粗匹配直接在原图上做，省掉两次复制
+    let scaled = (factor > 1).then(|| (downsample(haystack, factor), downsample(template, factor)));
+    let (coarse_page, coarse_tpl) = match &scaled {
+        Some((page, tpl)) => (page, tpl),
+        None => (haystack, template),
     };
     if coarse_tpl.width > coarse_page.width || coarse_tpl.height > coarse_page.height {
         return vec![];
     }
 
-    // 粗匹配只负责挑候选，判定交给原图精修。目标左上角和降采样网格对不齐时粗分数会掉：
-    // 实测 42x25 的文字按钮（倍数 3）在 9 种对齐偏移下粗分数 0.67–1.0，按原阈值筛会漏掉一大半位置。
-    // ponytail: 放宽 0.4 是按这组实测定的；更小、笔画更细的模板若还漏，再加大或改成只取前 N 名
-    let coarse_threshold = threshold - 0.4;
-    let page_integral = Integral::new(&coarse_page);
-    let (tmean, tnorm) = template_stats(&coarse_tpl);
+    // 粗匹配只负责挑候选，判定交给原图精修，所以不按阈值筛：目标左上角和降采样网格对不齐时
+    // 粗分数会掉，掉多少取决于模板的细节有多细——24x16、笔画只有 1px 的模板在 ox、oy 都是奇数的
+    // 偏移上一个候选都出不来（之前按 threshold-0.4 筛，64 个偏移漏 16 个）。
+    // 改成全算出来、靠下面的 NMS 取各邻域的最高分再截前 N 名。
+    // -1.0 只挡掉纯色窗口（zncc 给负无穷），真实分数都在 [-1, 1] 里。
+    // 倍数为 1 时粗匹配就是最终判定（没有降采样，也就没有相位问题），直接按 threshold 筛
+    let coarse_threshold = if factor == 1 { threshold } else { -1.0 };
+    let page_integral = Integral::new(coarse_page);
+    let (tmean, tnorm) = template_stats(coarse_tpl);
     let mut candidates: Vec<Candidate> = Vec::new();
     for y in 0..=coarse_page.height - coarse_tpl.height {
         for x in 0..=coarse_page.width - coarse_tpl.width {
-            let score = zncc(
-                &page_integral,
-                &coarse_page,
-                &coarse_tpl,
-                x,
-                y,
-                tmean,
-                tnorm,
-            );
+            let score = zncc(&page_integral, coarse_page, coarse_tpl, x, y, tmean, tnorm);
             if score >= coarse_threshold {
                 candidates.push(Candidate { x, y, score });
             }
@@ -446,40 +439,56 @@ pub fn find(haystack: &GrayImage, template: &GrayImage, threshold: f64, max: usi
     let radius = coarse_tpl.width.max(coarse_tpl.height) as f64 / 2.0;
     // 粗阈值放宽后，同尺寸的相似按钮也会进候选，粗分数还可能高过没对齐的真目标；
     // 名额少了（之前 --max 1 只留 4 个）真目标会被挤掉。
-    // ponytail: 至少留 32 个；一屏里长得像的元素超过这个数（大表格每行同样的按钮）仍可能漏，到时按模板大小算名额
-    let candidates = nms(candidates, radius, max.saturating_mul(4).clamp(32, 64));
+    // ponytail: 至少留 32 个；一屏里长得像的元素超过这个数（大表格每行同样的按钮）仍可能漏，到时按模板大小算名额。
+    // --max 要得比 64 还多时名额跟着 --max 走，不然要的位置会被默默砍掉
+    let candidates = nms(
+        candidates,
+        radius,
+        max.saturating_mul(4).clamp(32, max.max(64)),
+    );
     // 找不到匹配是常见路径，别为它白建原图积分图（4K 截图约 132MB）
     if candidates.is_empty() {
         return vec![];
     }
-    // 回原图在候选点附近 ±(factor+1) 窗口里精修
-    let full_integral = Integral::new(haystack);
-    let (tmean, tnorm) = template_stats(template);
-    let margin = factor + 1;
-    let mut matches: Vec<Candidate> = candidates
-        .iter()
-        .map(|coarse| {
-            let base_x = coarse.x * factor;
-            let base_y = coarse.y * factor;
-            let mut best = Candidate {
-                x: base_x,
-                y: base_y,
-                score: f64::MIN,
-            };
-            let y_end = (base_y + margin).min(haystack.height - template.height);
-            let x_end = (base_x + margin).min(haystack.width - template.width);
-            for y in base_y.saturating_sub(margin)..=y_end {
-                for x in base_x.saturating_sub(margin)..=x_end {
-                    let score = zncc(&full_integral, haystack, template, x, y, tmean, tnorm);
-                    if score > best.score {
-                        best = Candidate { x, y, score };
+    // 粗积分图之后用不到了，先放掉再建原图那张，两张大表不必同时占着内存
+    drop(page_integral);
+    let mut matches: Vec<Candidate> = if factor == 1 {
+        // 粗匹配就是在原图上做的，分数已经是最终分数，按阈值筛一遍即可，不必再扫一遍同样的数据。
+        // 候选是各自邻域里的最高分（NMS 半径比精修窗口大），精修也只会得到同一个位置
+        candidates
+            .into_iter()
+            .filter(|m| m.score >= threshold)
+            .collect()
+    } else {
+        // 回原图在候选点附近 ±(factor+1) 窗口里精修
+        let full_integral = Integral::new(haystack);
+        let (tmean, tnorm) = template_stats(template);
+        let margin = factor + 1;
+        candidates
+            .iter()
+            .map(|coarse| {
+                let base_x = coarse.x * factor;
+                let base_y = coarse.y * factor;
+                let mut best = Candidate {
+                    x: base_x,
+                    y: base_y,
+                    score: f64::MIN,
+                };
+                let y_end = (base_y + margin).min(haystack.height - template.height);
+                let x_end = (base_x + margin).min(haystack.width - template.width);
+                for y in base_y.saturating_sub(margin)..=y_end {
+                    for x in base_x.saturating_sub(margin)..=x_end {
+                        let score = zncc(&full_integral, haystack, template, x, y, tmean, tnorm);
+                        if score > best.score {
+                            best = Candidate { x, y, score };
+                        }
                     }
                 }
-            }
-            best
-        })
-        .filter(|m| m.score >= threshold)
-        .collect();
+                best
+            })
+            .filter(|m| m.score >= threshold)
+            .collect()
+    };
 
     let radius = template.width.min(template.height) as f64 / 4.0;
     matches = nms(matches, radius, max);
@@ -575,25 +584,30 @@ fn zncc(
     tmean: f64,
     tnorm: f64,
 ) -> f64 {
+    // 纯色的模板或窗口没有特征，相关性无从谈起：返回负无穷，不管 --threshold 给到多低都不会被当成匹配
     if tnorm == 0.0 {
-        return 0.0;
+        return f64::NEG_INFINITY;
     }
     let n = (template.width * template.height) as f64;
     let (sum, sumsq) = integral.window(x, y, template.width, template.height);
     let wmean = sum / n;
     let wvar = sumsq - n * wmean * wmean;
     if wvar <= 0.0 {
-        return 0.0;
+        return f64::NEG_INFINITY;
     }
-    let mut dot = 0.0;
+    // 整数乘积按行累加在 u32 里（一行最多 宽×255²，宽 66000 以内不会溢出），再进 u64，
+    // 最后一次性转成 f64：逐像素用 f64 累加，大模板上会丢精度
+    let mut dot = 0u64;
     for ty in 0..template.height {
         let row = (y + ty) * image.width + x;
         let trow = ty * template.width;
+        let mut row_dot = 0u32;
         for tx in 0..template.width {
-            dot += image.data[row + tx] as f64 * template.data[trow + tx] as f64;
+            row_dot += image.data[row + tx] as u32 * template.data[trow + tx] as u32;
         }
+        dot += row_dot as u64;
     }
-    ((dot - wmean * n * tmean) / (wvar.sqrt() * tnorm)).clamp(-1.0, 1.0)
+    ((dot as f64 - wmean * n * tmean) / (wvar.sqrt() * tnorm)).clamp(-1.0, 1.0)
 }
 
 /// 积分图：任意矩形窗口的像素和、平方和都能 O(1) 算出来
@@ -710,6 +724,14 @@ mod tests {
             matches.is_empty(),
             "纯色模板没有特征，不该匹配：{matches:?}"
         );
+        // --threshold 给 0 甚至负数也不能返回位置：vclick 会照着点下去
+        for threshold in [0.0, -1.0] {
+            let matches = find(&page, &template, threshold, 3);
+            assert!(
+                matches.is_empty(),
+                "阈值 {threshold} 下纯色模板仍不该匹配：{matches:?}"
+            );
+        }
     }
 
     #[test]
@@ -771,38 +793,80 @@ mod tests {
             }
         }
     }
-    /// 捏一块压暗的拼图状缺口（方块加圆形凸起），验证能找到
-    fn notch_image(width: usize, height: usize) -> (GrayImage, Vec<u8>) {
-        // 形状掩码：32x32 方块 + 顶部半径 10 的圆
-        let (w, h) = (40usize, 50usize);
+    /// 笔画只有 1px 的小模板：降采样把这些细节平均掉了，粗匹配分数在"模板和页面副本
+    /// 落在不同降采样相位"的偏移上会掉一大截（实测 ox、oy 都是奇数的 16 个位置），
+    /// 8x8 个偏移都要找得到
+    #[test]
+    fn finds_fine_detail_template_at_any_grid_offset() {
+        // 24x16（降采样倍数 2）：浅色底、1px 深色边框、内部几道 1px 的竖线和横线
+        let (w, h) = (24, 16);
+        let mut template = GrayImage {
+            width: w,
+            height: h,
+            data: vec![235; w * h],
+        };
+        for y in 0..h {
+            for x in 0..w {
+                let border = x == 0 || y == 0 || x == w - 1 || y == h - 1;
+                let stroke =
+                    (3..21).contains(&x) && (3..13).contains(&y) && (x % 3 == 0 || y % 4 == 0);
+                if border || stroke {
+                    template.data[y * w + x] = 30;
+                }
+            }
+        }
+        for oy in 0..8 {
+            for ox in 0..8 {
+                let mut page = GrayImage {
+                    width: 400,
+                    height: 300,
+                    data: vec![255; 400 * 300],
+                };
+                paste(&mut page, &template, 60 + ox, 40 + oy);
+                let matches = find(&page, &template, 0.8, 1);
+                assert_eq!(matches.len(), 1, "偏移 ({ox},{oy}) 没找到：{matches:?}");
+                assert_eq!(
+                    (matches[0].x, matches[0].y),
+                    ((60 + ox) as f64, (40 + oy) as f64),
+                    "偏移 ({ox},{oy}) 位置不对"
+                );
+            }
+        }
+    }
+
+    /// 捏一块压暗的拼图状缺口（方块加圆形凸起），验证能找到。
+    /// `scale` 是整图放大倍数，用来造 2 倍、3 倍图的验证码
+    fn notch_image(width: usize, height: usize, scale: usize) -> (GrayImage, Vec<u8>) {
+        // 形状掩码：32x32 方块 + 顶部半径 10 的圆，按 scale 放大
+        let (w, h) = (40 * scale, 50 * scale);
         let mut mask = vec![0u8; w * h];
-        for y in 10..h {
-            for x in 4..w - 4 {
+        for y in 10 * scale..h {
+            for x in 4 * scale..w - 4 * scale {
                 mask[y * w + x] = 1;
             }
         }
-        for y in 0..20 {
+        for y in 0..20 * scale {
             for x in 0..w {
-                let dx = x as i64 - 20;
-                let dy = y as i64 - 10;
-                if dx * dx + dy * dy <= 100 {
+                let dx = x as i64 - 20 * scale as i64;
+                let dy = y as i64 - 10 * scale as i64;
+                if dx * dx + dy * dy <= 100 * (scale * scale) as i64 {
                     mask[y * w + x] = 1;
                 }
             }
         }
-        // 有结构的底图：低频渐变加小块纹理，接近真实验证码背景
+        // 有结构的底图：低频渐变加小块纹理，接近真实验证码背景；纹理也跟着放大
         let mut page = GrayImage {
             width,
             height,
             data: (0..width * height)
                 .map(|i| {
-                    let (x, y) = (i % width, i / width);
+                    let (x, y) = (i % width / scale, i / width / scale);
                     (100 + (x * 3 + y * 7) % 50 + (x / 4 + y / 4) % 2 * 20) as u8
                 })
                 .collect(),
         };
         // 缺口处恒定压暗 50
-        let (nx, ny) = (100usize, 40usize);
+        let (nx, ny) = (100 * scale, 40 * scale);
         for y in 0..h {
             for x in 0..w {
                 if mask[y * w + x] == 1 {
@@ -816,7 +880,7 @@ mod tests {
 
     #[test]
     fn finds_darkened_notch_without_piece() {
-        let (page, _mask) = notch_image(220, 140);
+        let (page, _mask) = notch_image(220, 140, 1);
         let gaps = find_gap(&page, None, 5);
         // 没有滑块形状可参考时会返回多个候选，缺口（100,40,40x50）要在其中
         assert!(
@@ -826,10 +890,54 @@ mod tests {
         );
     }
 
+    /// 没给 --piece 时也要把真缺口排进前 3：一张 320x180 的图里有一个 48x52 的拼图状缺口，
+    /// 外加一个同样大小的方块干扰。固定半径 16（窗口 33x33）比缺口还小，缺口内部显不出整体变暗，
+    /// 真缺口会被背景上的零碎检出挤到第 4 名开外
+    #[test]
+    fn finds_notch_without_piece_among_distractors() {
+        let (width, height) = (320usize, 180usize);
+        let mut page = GrayImage {
+            width,
+            height,
+            data: (0..width * height)
+                .map(|i| {
+                    let (x, y) = (i % width, i / width);
+                    let grain = (x * 37 + y * 101 + (x * y) % 13) % 25;
+                    (100 + (x * 3 + y * 7) % 50 + (x / 4 + y / 4) % 2 * 20 + grain) as u8
+                })
+                .collect(),
+        };
+        let darken =
+            |page: &mut GrayImage, x0: usize, y0: usize, inside: &dyn Fn(usize, usize) -> bool| {
+                for y in 0..52 {
+                    for x in 0..48 {
+                        if inside(x, y) {
+                            let i = (y0 + y) * width + x0 + x;
+                            page.data[i] = page.data[i].saturating_sub(50);
+                        }
+                    }
+                }
+            };
+        // 真缺口：方块 + 顶部圆形凸起（拼图块的常见形状）
+        darken(&mut page, 60, 50, &|x, y| {
+            let (dx, dy) = (x as i64 - 24, y as i64 - 12);
+            (y >= 12 && (5..43).contains(&x)) || dx * dx + dy * dy <= 144
+        });
+        // 干扰：同样大小的纯方块
+        darken(&mut page, 210, 100, &|_, _| true);
+
+        let gaps = find_gap(&page, None, 3);
+        assert!(
+            gaps.iter()
+                .any(|g| g.x.abs_diff(60) <= 12 && g.y <= 62 && g.y + g.h >= 50),
+            "前 3 个候选里应有真缺口（60,50）：{gaps:?}"
+        );
+    }
+
     #[test]
     fn tolerates_fully_transparent_piece() {
         // 抠坏的全透明滑块图：不应 panic，退化成无形状打分
-        let (page, _mask) = notch_image(220, 140);
+        let (page, _mask) = notch_image(220, 140, 1);
         let piece = Image {
             gray: GrayImage {
                 width: 40,
@@ -868,7 +976,7 @@ mod tests {
 
     #[test]
     fn finds_darkened_notch_with_piece_shape() {
-        let (page, mask) = notch_image(220, 140);
+        let (page, mask) = notch_image(220, 140, 1);
         let piece = Image {
             gray: GrayImage {
                 width: 40,
@@ -882,6 +990,29 @@ mod tests {
         let g = &gaps[0];
         assert!(
             g.x.abs_diff(100) <= 12 && g.y.abs_diff(40) <= 12,
+            "位置偏差过大：{g:?}"
+        );
+        assert!(g.iou > 0.5, "形状应该吻合：{g:?}");
+    }
+
+    /// 3 倍图（真实验证码常见）：局部均值半径和连通域面积上限都要跟着滑块尺寸走，
+    /// 用固定值时滑块 120x150 的图一个候选都出不来
+    #[test]
+    fn finds_notch_in_scaled_image() {
+        let (page, mask) = notch_image(660, 420, 3);
+        let piece = Image {
+            gray: GrayImage {
+                width: 120,
+                height: 150,
+                data: vec![128; 120 * 150],
+            },
+            alpha: Some(mask.iter().map(|&v| v * 255).collect()),
+        };
+        let gaps = find_gap(&page, Some(&piece), 3);
+        assert!(!gaps.is_empty(), "3 倍图上也该检出缺口");
+        let g = &gaps[0];
+        assert!(
+            g.x.abs_diff(300) <= 36 && g.y.abs_diff(120) <= 36,
             "位置偏差过大：{g:?}"
         );
         assert!(g.iou > 0.5, "形状应该吻合：{g:?}");
