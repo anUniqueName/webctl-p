@@ -376,7 +376,9 @@ fn launch_chrome(home: &Path, session_name: &str, headless: bool) -> Result<Sess
     // 启动前不删 DevToolsActivePort：同一配置目录已经有 Chrome 在跑时，新进程把请求转交给它后退出，
     // 这时文件里是那个实例的端口，照样能接上。文件是上次崩溃留下的旧端口时连不通，接着轮询等它被覆盖
     let port_file = profile.join("DevToolsActivePort");
-    let deadline = Instant::now() + Duration::from_secs(15);
+    // 等 30 秒：先要等 Chrome 把文件写出来（本机 0.5 秒，GitHub Actions 的 runner 上冷启动 5 秒），
+    // 再要等端口能连上，连不上的那次检查本身最多占 3 秒。之前 15 秒，CI 上有一次就这么超时了
+    let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
         // 文件第一行就是调试端口
         if let Some(endpoint) = fs::read_to_string(&port_file)
@@ -395,7 +397,7 @@ fn launch_chrome(home: &Path, session_name: &str, headless: bool) -> Result<Sess
         thread::sleep(Duration::from_millis(100));
     }
     bail!(
-        "Chrome 启动后 15 秒内未开放调试端口；若该配置目录已有 Chrome 在运行，请先关闭后重试，或用 --cdp 连接"
+        "Chrome 启动后 30 秒内未开放调试端口；若该配置目录已有 Chrome 在运行，请先关闭后重试，或用 --cdp 连接"
     )
 }
 
