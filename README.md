@@ -6,7 +6,7 @@
 
 不装 Rust：到 [Releases](https://github.com/anUniqueName/webctl-p/releases) 下载对应版本的 `webctl-windows-x86_64.zip`，把里面的 `webctl.exe` 放进 PATH 里的目录（如 `%USERPROFILE%\.cargo\bin`）。
 
-按标签从 GitHub 装：`cargo install --git https://github.com/anUniqueName/webctl-p.git --tag v0.4.1`。
+按标签从 GitHub 装：`cargo install --git https://github.com/anUniqueName/webctl-p.git --tag v0.6.0`。
 
 从源码装：
 

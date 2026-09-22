@@ -1,6 +1,6 @@
 # 更新记录
 
-## 未发布
+## 0.6.0 - 2026-09-22
 
 - 启动 Chrome 改为让 Chrome 自己挑调试端口（`--remote-debugging-port=0`），再从配置目录的 `DevToolsActivePort` 读回来。之前是 webctl 自己占一个空闲端口再放掉、传给 Chrome：Chrome 启动慢或两条命令同时首次启动时会撞号，端口开不出来，命令报错还不写状态文件，而 Chrome 已经活着占住了配置目录，之后每条命令都重新启动一次、每次都等满 15 秒超时。现在同一个配置目录已有 Chrome 在跑时也能接上它，不用先让人去关浏览器。
 - `click`、`hover`、`scroll --in` 定位元素时滚动改为不带动画（`behavior: 'instant'`）。页面设了 `scroll-behavior: smooth` 时，之前量到的是滚动动画中途的位置，点击落在别处。
