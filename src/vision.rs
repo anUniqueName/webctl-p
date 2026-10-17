@@ -756,7 +756,8 @@ pub fn merge_boxes(boxes: Vec<[usize; 4]>, gap: usize, cap: f64) -> Vec<[usize; 
         'outer: for i in 0..boxes.len() {
             for j in i + 1..boxes.len() {
                 let (p, q) = (boxes[i], boxes[j]);
-                if p[2] + gap < q[0] || q[2] + gap < p[0] || p[3] + gap < q[1] || q[3] + gap < p[1] {
+                if p[2] + gap < q[0] || q[2] + gap < p[0] || p[3] + gap < q[1] || q[3] + gap < p[1]
+                {
                     continue;
                 }
                 let merged = [

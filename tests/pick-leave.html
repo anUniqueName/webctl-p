@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8">
+  <title>pick leave fixture</title>
+  <style>
+    body { margin: 0; font-family: "Microsoft YaHei", sans-serif; }
+    .wrap { position: absolute; left: 40px; top: 40px; }
+    .word { width: 120px; height: 40px; background-repeat: no-repeat; background-position: 50% 100%; }
+    .clickableImg { width: 340px; height: 200px; background-repeat: no-repeat; background-position: 50% 0%; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="word"></div>
+    <div class="clickableImg"></div>
+  </div>
+  <script>
+    // 和 pick.html 同一张图，但点一下就跳到别的页面（验证通过后跳走、或被踢回别处）。
+    // 新页面上没有 .clickableImg：pick --click 点完第一下要停下，不能在新页面上接着点。
+    function draw(tint) {
+      const c = document.createElement('canvas');
+      c.width = 340; c.height = 240;
+      const g = c.getContext('2d');
+      const sky = g.createLinearGradient(0, 0, 0, 200);
+      sky.addColorStop(0, tint);
+      sky.addColorStop(1, '#2f4a63');
+      g.fillStyle = sky;
+      g.fillRect(0, 0, 340, 200);
+      g.fillStyle = '#ffd400';
+      g.font = 'bold 40px "Microsoft YaHei", sans-serif';
+      g.textBaseline = 'middle';
+      g.fillText('稀', 30, 45);
+      g.fillText('调', 130, 120);
+      g.fillText('帧', 250, 60);
+      g.fillStyle = '#ffffff';
+      g.fillRect(0, 200, 340, 40);
+      g.fillStyle = '#111111';
+      g.font = 'bold 28px "Microsoft YaHei", sans-serif';
+      g.fillText('稀调帧', 120, 222);
+      return c.toDataURL();
+    }
+
+    const url = `url(${draw('#7fa8c9')})`;
+    const img = document.querySelector('.clickableImg');
+    document.querySelector('.word').style.backgroundImage = url;
+    img.style.backgroundImage = url;
+
+    img.addEventListener('click', () => {
+      location.href = 'about:blank';
+    });
+  </script>
+</body>
+</html>

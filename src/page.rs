@@ -2177,7 +2177,7 @@ const PICK_JS: &str = r#"(() => {
   const word = document.querySelector('.word');
   if (!img || !word) return null;
   // 参考条和可点图要落在同一张截图里：先把参考条滚到视口中间
-  word.scrollIntoView({ block: 'center', inline: 'nearest' });
+  word.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' });
   const rect = el => {
     const b = el.getBoundingClientRect();
     return { x: b.x, y: b.y, w: b.width, h: b.height };
@@ -2370,7 +2370,7 @@ pub fn pick(
             }
             // 点完看页面变没变：换题或跳走就停下，别拿旧坐标继续点
             let after = eval_value(browser, &session, PICK_JS).unwrap_or(Value::Null);
-            if !after.is_null() && after["sig"].as_str().unwrap_or_default() != before {
+            if after.is_null() || after["sig"].as_str().unwrap_or_default() != before {
                 remaining.extend(ids[index + 1..].iter().cloned());
                 break;
             }
@@ -2440,22 +2440,19 @@ fn gap_px(dpr: f64) -> usize {
 /// 空白列不一定够用：字挨得太紧时切不开（少于 3 段），偏旁之间有空隙时又会切碎（多于 3 段）。
 /// 于是两种兜底：多了就把间隔最小的相邻段并掉，少了就退回等分。
 fn ref_segments(img: &image::RgbImage, dpr: f64) -> Vec<(usize, usize)> {
-    let (w, h) = (img.width() as usize, img.height() as usize);
+    let w = img.width() as usize;
     let mut cols = vec![0usize; w];
-    for y in 0..h {
-        for x in 0..w {
-            let px = img.get_pixel(x as u32, y as u32);
-            if px[0] as u32 + px[1] as u32 + (px[2] as u32) < 320 {
-                cols[x] += 1;
-            }
+    for (x, _, px) in img.enumerate_pixels() {
+        if px[0] as u32 + px[1] as u32 + (px[2] as u32) < 320 {
+            cols[x as usize] += 1;
         }
     }
     let min_gap = (3.0 * dpr).round().max(2.0) as usize;
     let mut out: Vec<(usize, usize)> = Vec::new();
     let mut start: Option<usize> = None;
     let mut blank = 0usize;
-    for x in 0..w {
-        if cols[x] > 0 {
+    for (x, &count) in cols.iter().enumerate() {
+        if count > 0 {
             if start.is_none() {
                 start = Some(x);
             }
@@ -2474,10 +2471,10 @@ fn ref_segments(img: &image::RgbImage, dpr: f64) -> Vec<(usize, usize)> {
             }
         }
     }
-    if let Some(from) = start {
-        if w > from + 2 {
-            out.push((from, w));
-        }
+    if let Some(from) = start
+        && w > from + 2
+    {
+        out.push((from, w));
     }
 
     // 偏旁之间的空隙会被切碎：把间隔最小的相邻段并回去，直到 3 段
@@ -2538,7 +2535,15 @@ fn montage(
     let ch = 2 * (CELL + 2 * PAD) + PAD;
     let mut buf = vec![252u8; cw * ch * 3];
     for (i, (x0, x1)) in segments.iter().enumerate() {
-        paste_scaled(&mut buf, cw, ch, refs_area, (*x0, 0, *x1, refs_area.height() as usize), i, 0);
+        paste_scaled(
+            &mut buf,
+            cw,
+            ch,
+            refs_area,
+            (*x0, 0, *x1, refs_area.height() as usize),
+            i,
+            0,
+        );
     }
     for (i, b) in boxes.iter().enumerate() {
         paste_scaled(
