@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8">
+  <title>pick fixture</title>
+  <style>
+    body { margin: 0; font-family: "Microsoft YaHei", sans-serif; }
+    /* .wrap 在 (40,40)；.word 占上边 40px，所以可点图从 y=80 起。
+       pick 给出的必须是视口坐标，源图坐标要加上这个偏移 */
+    .wrap { position: absolute; left: 40px; top: 40px; }
+    .word {
+      width: 120px; height: 40px;
+      background-repeat: no-repeat;
+      background-position: 50% 100%;
+    }
+    .clickableImg {
+      width: 340px; height: 200px;
+      background-repeat: no-repeat;
+      background-position: 50% 0%;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="word"></div>
+    <div class="clickableImg"></div>
+  </div>
+  <script>
+    // 仿点选验证：同一张图，上部是照片 + 黄字，底部 40px 是黑色参考字。
+    // 图在页面里现画，不额外放二进制夹具；测试只关心"认出几个、坐标对不对、点击到不到"。
+    const c = document.createElement('canvas');
+    c.width = 340; c.height = 240;
+    const g = c.getContext('2d');
+
+    const sky = g.createLinearGradient(0, 0, 0, 200);
+    sky.addColorStop(0, '#7fa8c9');
+    sky.addColorStop(1, '#2f4a63');
+    g.fillStyle = sky;
+    g.fillRect(0, 0, 340, 200);
+
+    g.fillStyle = '#ffd400';
+    g.font = 'bold 40px "Microsoft YaHei", sans-serif';
+    g.textBaseline = 'middle';
+    g.fillText('稀', 30, 45);
+    g.fillText('调', 130, 120);
+    g.fillText('帧', 250, 60);
+
+    g.fillStyle = '#ffffff';
+    g.fillRect(0, 200, 340, 40);
+    g.fillStyle = '#111111';
+    g.font = 'bold 28px "Microsoft YaHei", sans-serif';
+    g.fillText('稀调帧', 120, 222);
+
+    const url = `url(${c.toDataURL()})`;
+    document.querySelector('.word').style.backgroundImage = url;
+    document.querySelector('.clickableImg').style.backgroundImage = url;
+
+    window.webctlClicks = [];
+    document.querySelector('.clickableImg').addEventListener('click', ev => {
+      const r = ev.currentTarget.getBoundingClientRect();
+      window.webctlClicks.push({
+        x: Math.round(ev.clientX - r.left),
+        y: Math.round(ev.clientY - r.top),
+      });
+      document.title = 'pick clicked ' + window.webctlClicks.length;
+    });
+  </script>
+</body>
+</html>

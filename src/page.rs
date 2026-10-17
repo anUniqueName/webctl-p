@@ -2165,6 +2165,343 @@ const ANNOTATE_ADD: &str = r#"(() => {
 })()"#;
 const ANNOTATE_REMOVE: &str = "document.getElementById('__webctl_overlay')?.remove(); true";
 
+/// 点选验证（"请依次点击 A B C"）用的 JS：取可点区域几何 + 源图（base64）。
+/// 参考条和可点图是同一张背景图，只取一次。
+const PICK_JS: &str = r#"(() => {
+  const img = document.querySelector('.clickableImg');
+  const word = document.querySelector('.word');
+  if (!img || !word) return null;
+  const rect = el => {
+    const b = el.getBoundingClientRect();
+    return { x: b.x, y: b.y, w: b.width, h: b.height };
+  };
+  const url = getComputedStyle(img).backgroundImage.slice(5, -2);
+  return fetch(url).then(r => r.arrayBuffer()).then(buf => {
+    const bytes = new Uint8Array(buf);
+    let s = '';
+    for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+    return { img: rect(img), word: rect(word), data: btoa(s) };
+  });
+})()"#;
+
+/// 源图底部这一条是黑色参考字。
+const PICK_REF_BAND: usize = 40;
+/// 黄字是很饱和的纯黄；阈值放低会把日出、黄昏的天空算进来，几个字会被连成一块。
+const PICK_YELLOW: (i32, i32, i32) = (200, 170, 90);
+/// 小于这个像素数的连通域当噪点。
+const PICK_MIN_BLOB: usize = 120;
+
+/// 找出点选验证里的候选字，给出视口坐标和一张对照图（上排参考字、下排候选字）。
+///
+/// 认字这步留给调用方看对照图——这里只做图像处理，不猜哪个黄字对应哪个参考字。
+/// 给了 `click`（如 `C2,C1,C3`）就按该顺序点击，一条命令走完。
+pub fn pick(
+    browser: &mut Browser,
+    out: Option<&Path>,
+    click: Option<&str>,
+    settle: u64,
+    timeout: u64,
+) -> Result<Value> {
+    let session = browser.attach_current()?;
+    let probe = eval_value(browser, &session, PICK_JS)?;
+    if probe.is_null() {
+        bail!("当前页面不是点选验证页（没有 .clickableImg / .word）");
+    }
+    let origin_x = probe["img"]["x"].as_f64().unwrap_or(0.0);
+    let origin_y = probe["img"]["y"].as_f64().unwrap_or(0.0);
+    let shown_w = probe["img"]["w"].as_f64().unwrap_or(0.0);
+    let data = probe["data"]
+        .as_str()
+        .ok_or_else(|| anyhow!("取不到验证图"))?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .context("验证图 base64 解码失败")?;
+    let rgb = decode_rgb(&bytes)?;
+    let (w, h) = (rgb.width() as usize, rgb.height() as usize);
+
+    // 黄字掩码；参考条那条不算
+    let (r_lo, g_lo, b_hi) = PICK_YELLOW;
+    let mut yellow = vec![0f32; w * h];
+    for (i, px) in rgb.pixels().enumerate() {
+        let (r, g, b) = (px[0] as i32, px[1] as i32, px[2] as i32);
+        if r > r_lo && g > g_lo && b < b_hi {
+            yellow[i] = 1.0;
+        }
+    }
+    for y in h.saturating_sub(PICK_REF_BAND + 5)..h {
+        for x in 0..w {
+            yellow[y * w + x] = 0.0;
+        }
+    }
+
+    // 同一个字可能碎成几块（氵、上下结构），按"合并后不超过一个字大"并回去；
+    // 阈值跟着字的大小走，图被放大过也不会散架
+    let raw = label_boxes(&yellow, w, h, PICK_MIN_BLOB);
+    let median = median_side(&raw);
+    let cap = (median * 2.0).max(60.0);
+    let boxes = merge_boxes(raw, 25, cap);
+
+    // 参考条：底部若干行的暗像素，按列跨度三等分
+    let strip_top = h.saturating_sub(PICK_REF_BAND);
+    let mut col_dark = vec![0usize; w];
+    for y in strip_top..h {
+        for x in 0..w {
+            let px = rgb.get_pixel(x as u32, y as u32);
+            if px[0] as u32 + px[1] as u32 + (px[2] as u32) < 320 {
+                col_dark[x] += 1;
+            }
+        }
+    }
+    let lo = col_dark.iter().position(|&c| c > 0);
+    let hi = col_dark.iter().rposition(|&c| c > 0);
+    let mut ref_ranges = Vec::new();
+    if let (Some(lo), Some(hi)) = (lo, hi)
+        && hi > lo + 6
+    {
+        let step = (hi - lo) as f64 / 3.0;
+        for i in 0..3 {
+            let x0 = lo + (step * i as f64).round() as usize;
+            let x1 = lo + (step * (i + 1) as f64).round() as usize;
+            ref_ranges.push((x0, x1.min(w)));
+        }
+    }
+
+    let scale = if w == 0 { 1.0 } else { shown_w / w as f64 };
+    let candidates: Vec<Value> = boxes
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            let cx = (b[0] + b[2]) as f64 / 2.0;
+            let cy = (b[1] + b[3]) as f64 / 2.0;
+            let x = origin_x + cx * scale;
+            let y = origin_y + cy * scale;
+            json!({
+                "id": format!("C{}", i + 1),
+                "x": (x * 100.0).round() / 100.0,
+                "y": (y * 100.0).round() / 100.0,
+                "src": [b[0], b[1], b[2], b[3]],
+            })
+        })
+        .collect();
+
+    let mut output = Map::new();
+    output.insert("candidates".to_owned(), Value::Array(candidates.clone()));
+    output.insert("refs".to_owned(), json!(ref_ranges.len()));
+    if let Some(path) = out {
+        let (mw, mh, buf) = montage(&rgb, (w, h), &ref_ranges, &boxes);
+        write_rgb_png(path, mw, mh, &buf)?;
+        output.insert("montage".to_owned(), json!(path.display().to_string()));
+    }
+    let mut warnings = Vec::new();
+    if ref_ranges.len() != 3 || boxes.len() != 3 {
+        warnings.push(format!(
+            "expected 3 refs and 3 candidates, got {} and {}",
+            ref_ranges.len(),
+            boxes.len()
+        ));
+    }
+    output.insert("warnings".to_owned(), json!(warnings));
+
+    if let Some(order) = click {
+        let mut clicked = Vec::new();
+        for id in order.split(',').map(|s| s.trim().to_uppercase()) {
+            if id.is_empty() {
+                continue;
+            }
+            let found = output["candidates"]
+                .as_array()
+                .and_then(|list| list.iter().find(|c| c["id"] == json!(id)))
+                .cloned();
+            let candidate = found.ok_or_else(|| anyhow!("候选里没有 {id}"))?;
+            let x = candidate["x"].as_f64().unwrap_or(0.0);
+            let y = candidate["y"].as_f64().unwrap_or(0.0);
+            let result = click_at(browser, x, y, false, false, None, settle, timeout)?;
+            clicked.push(json!({"id": id, "x": x, "y": y, "changes": result["changes"].clone()}));
+            thread::sleep(Duration::from_millis(700));
+        }
+        output.insert("clicked".to_owned(), Value::Array(clicked));
+    }
+    Ok(Value::Object(output))
+}
+
+/// 把验证图解成 RGB。PNG 走 png crate（image 那份没开 png 特性，别为这个多拉一个依赖），
+/// 其余格式交给 image。
+fn decode_rgb(bytes: &[u8]) -> Result<image::RgbImage> {
+    const PNG_MAGIC: &[u8] = b"\x89PNG";
+    if !bytes.starts_with(PNG_MAGIC) {
+        return Ok(image::load_from_memory(bytes)
+            .context("无法解码验证图（支持 PNG/JPEG/WebP）")?
+            .to_rgb8());
+    }
+    let mut decoder = png::Decoder::new(bytes);
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = decoder.read_info().context("无法解析 PNG 头")?;
+    let mut buf = vec![0; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).context("无法解码 PNG")?;
+    let pixels = &buf[..info.buffer_size()];
+    let (w, h) = (info.width as usize, info.height as usize);
+    let mut rgb = Vec::with_capacity(w * h * 3);
+    match info.color_type {
+        png::ColorType::Rgb => rgb.extend_from_slice(pixels),
+        png::ColorType::Rgba => {
+            for px in pixels.chunks_exact(4) {
+                rgb.extend_from_slice(&px[..3]);
+            }
+        }
+        png::ColorType::Grayscale => {
+            for &v in pixels {
+                rgb.extend_from_slice(&[v, v, v]);
+            }
+        }
+        png::ColorType::GrayscaleAlpha => {
+            for px in pixels.chunks_exact(2) {
+                rgb.extend_from_slice(&[px[0], px[0], px[0]]);
+            }
+        }
+        png::ColorType::Indexed => bail!("不支持的 PNG 调色板格式"),
+    }
+    image::RgbImage::from_raw(w as u32, h as u32, rgb).ok_or_else(|| anyhow!("验证图尺寸异常"))
+}
+
+/// 4 邻域连通域，返回 [x0, y0, x1, y1]（含端点），先上后下再左到右。
+fn label_boxes(mask: &[f32], w: usize, h: usize, min_px: usize) -> Vec<[usize; 4]> {
+    let mut seen = vec![false; w * h];
+    let mut out = Vec::new();
+    for start in 0..w * h {
+        if seen[start] || mask[start] <= 0.0 {
+            continue;
+        }
+        seen[start] = true;
+        let mut stack = vec![start];
+        let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0usize, 0usize);
+        let mut count = 0usize;
+        while let Some(i) = stack.pop() {
+            let (x, y) = (i % w, i / w);
+            x0 = x0.min(x);
+            x1 = x1.max(x);
+            y0 = y0.min(y);
+            y1 = y1.max(y);
+            count += 1;
+            for next in [
+                (x > 0).then(|| i - 1),
+                (x + 1 < w).then(|| i + 1),
+                (y > 0).then(|| i - w),
+                (y + 1 < h).then(|| i + w),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if !seen[next] && mask[next] > 0.0 {
+                    seen[next] = true;
+                    stack.push(next);
+                }
+            }
+        }
+        if count >= min_px {
+            out.push([x0, y0, x1, y1]);
+        }
+    }
+    out.sort_by_key(|b| (b[1] / 40, b[0]));
+    out
+}
+
+fn median_side(boxes: &[[usize; 4]]) -> f64 {
+    let mut sides: Vec<f64> = boxes
+        .iter()
+        .map(|b| (b[2] - b[0]).max(b[3] - b[1]) as f64)
+        .collect();
+    if sides.is_empty() {
+        return 0.0;
+    }
+    sides.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    sides[sides.len() / 2]
+}
+
+/// 把同一个字的碎块合回一块：挨得够近，且合并后包围盒不超过 `cap`。
+fn merge_boxes(boxes: Vec<[usize; 4]>, gap: usize, cap: f64) -> Vec<[usize; 4]> {
+    let mut boxes = boxes;
+    let mut changed = true;
+    while changed {
+        changed = false;
+        'outer: for i in 0..boxes.len() {
+            for j in i + 1..boxes.len() {
+                let (p, q) = (boxes[i], boxes[j]);
+                if p[2] + gap < q[0] || q[2] + gap < p[0] || p[3] + gap < q[1] || q[3] + gap < p[1] {
+                    continue;
+                }
+                let merged = [
+                    p[0].min(q[0]),
+                    p[1].min(q[1]),
+                    p[2].max(q[2]),
+                    p[3].max(q[3]),
+                ];
+                let span = (merged[2] - merged[0]).max(merged[3] - merged[1]) as f64;
+                if span > cap {
+                    continue;
+                }
+                boxes[i] = merged;
+                boxes.remove(j);
+                changed = true;
+                break 'outer;
+            }
+        }
+    }
+    boxes
+}
+
+/// 对照图：上排参考字、下排候选字，各放大到 cell 见方。
+fn montage(
+    rgb: &image::RgbImage,
+    (w, h): (usize, usize),
+    refs: &[(usize, usize)],
+    boxes: &[[usize; 4]],
+) -> (usize, usize, Vec<u8>) {
+    const CELL: usize = 150;
+    const PAD: usize = 8;
+    let cols = 3.max(refs.len()).max(boxes.len());
+    let cw = cols * (CELL + 2 * PAD) + PAD;
+    let ch = 2 * (CELL + 2 * PAD) + PAD;
+    let mut buf = vec![252u8; cw * ch * 3];
+
+    let mut put = |crop: (usize, usize, usize, usize), col: usize, row: usize| {
+        let (x0, y0, x1, y1) = crop;
+        let (sw, sh) = (x1.saturating_sub(x0), y1.saturating_sub(y0));
+        if sw == 0 || sh == 0 {
+            return;
+        }
+        let k = (CELL as f64 / sw as f64).min(CELL as f64 / sh as f64);
+        let (dw, dh) = ((sw as f64 * k) as usize, (sh as f64 * k) as usize);
+        let ox = PAD + col * (CELL + 2 * PAD) + (CELL - dw) / 2;
+        let oy = PAD + row * (CELL + 2 * PAD) + (CELL - dh) / 2;
+        for y in 0..dh {
+            for x in 0..dw {
+                let sx = x0 + x * sw / dw.max(1);
+                let sy = y0 + y * sh / dh.max(1);
+                let px = rgb.get_pixel(sx.min(w - 1) as u32, sy.min(h - 1) as u32);
+                let i = ((oy + y) * cw + ox + x) * 3;
+                buf[i..i + 3].copy_from_slice(&px.0[..3]);
+            }
+        }
+    };
+
+    for (i, (x0, x1)) in refs.iter().enumerate() {
+        put((*x0, h - PICK_REF_BAND, *x1, h), i, 0);
+    }
+    for (i, b) in boxes.iter().enumerate() {
+        put((b[0].saturating_sub(3), b[1].saturating_sub(3), b[2] + 3, b[3] + 3), i, 1);
+    }
+    (cw, ch, buf)
+}
+
+fn write_rgb_png(path: &Path, w: usize, h: usize, rgb: &[u8]) -> Result<()> {
+    let file = fs::File::create(path).with_context(|| format!("无法写入 {}", path.display()))?;
+    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), w as u32, h as u32);
+    encoder.set_color(png::ColorType::Rgb);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder.write_header()?.write_image_data(rgb)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

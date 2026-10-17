@@ -800,6 +800,41 @@ fn chrome_smoke() {
         "控件容器还没撑开也要认得出拦截页：{unrendered_page}"
     );
 
+    // 点选验证：pick 要给出视口坐标（夹具把图放在 40,40，源图坐标必须加上这个偏移）、
+    // 能写出对照图，并能按给定顺序点击
+    let pick_page = root.join("tests/pick.html");
+    let opened_pick = json(&home, &["open", &pick_page.to_string_lossy()]);
+    assert_eq!(opened_pick["ok"], true, "{opened_pick}");
+    let montage = home.join("pick-montage.png");
+    let picked = json(&home, &["pick", "--out", &montage.to_string_lossy()]);
+    let candidates = picked["candidates"].as_array().cloned().unwrap_or_default();
+    assert_eq!(candidates.len(), 3, "应认出三个候选字：{picked}");
+    assert_eq!(picked["refs"], 3, "参考条也要分出三个字：{picked}");
+    assert!(montage.exists(), "对照图没写出来：{picked}");
+    for candidate in &candidates {
+        let src = candidate["src"].as_array().unwrap();
+        let cx = (src[0].as_f64().unwrap() + src[2].as_f64().unwrap()) / 2.0;
+        let cy = (src[1].as_f64().unwrap() + src[3].as_f64().unwrap()) / 2.0;
+        let x = candidate["x"].as_f64().unwrap();
+        let y = candidate["y"].as_f64().unwrap();
+        assert!(
+            (x - (40.0 + cx)).abs() < 1.5 && (y - (80.0 + cy)).abs() < 1.5,
+            "候选坐标要是视口坐标（.wrap 在 40,40，.word 占 40 高，图从 y=80 起）：{candidate}"
+        );
+    }
+    let clicked_pick = json(&home, &["pick", "--click", "C1,C2,C3", "--settle", "300"]);
+    assert_eq!(
+        clicked_pick["clicked"].as_array().map(|c| c.len()),
+        Some(3),
+        "{clicked_pick}"
+    );
+    let title = json(&home, &["eval", "document.title"]);
+    assert_eq!(
+        title["result"].as_str(),
+        Some("pick clicked 3"),
+        "三次点击都要落到可点区域上：{title}"
+    );
+
     // fixture 里有一个 display:none 的 captcha 容器，文字是"拖动"：没渲染出来的不算拼图验证页
     let normal = json(&home, &["open", &fixture_text]);
     assert!(normal["blocked"].is_null(), "正常页面不该报拦截：{normal}");
