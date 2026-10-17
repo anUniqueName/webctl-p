@@ -73,8 +73,14 @@ const CHALLENGE_JS: &str = r#"(() => {
   if (has('#challenge-form, #cf-challenge-running')) return 'cloudflare';
   if (/^(just a moment|attention required|checking your browser|请稍候)/i.test(title)) return 'cloudflare';
   // 勾选框控件也可能嵌在正常页面的评论、结账表单里，所以只在正文很短、还没拿到 token 时才算拦截页。
-  // [id^="cf-chl-widget"] 和 turnstile 定位用的是同一个选择器：量得到控件的整页验证，这里也要认得出
-  if (has('.cf-turnstile, [id^="cf-chl-widget"], iframe[src*="challenges.cloudflare.com"]') && body().length < 5000
+  // [id^="cf-chl-widget"] 和 turnstile 定位用的是同一个选择器：量得到控件的整页验证，这里也要认得出。
+  // 但隐藏的 cf-chl-widget-xxx_response input 要分开看：整页验证的主文档里常常只有它（勾选框在它父元素的
+  // 封闭 shadow root 里），它带标准 name，所以仍然算控件；而 dash.cloudflare.com 登录页上那个同名隐藏字段
+  // 没有 name，只是隐形 Turnstile 的落点，算进去会把正常登录页误报成验证页。
+  // 不按"有没有宽高"过滤：拦截页的控件容器常常是先插入、隔一会儿才撑开的 0×0 元素，按渲染尺寸过滤会漏判
+  const widget = [...document.querySelectorAll('.cf-turnstile, [id^="cf-chl-widget"], iframe[src*="challenges.cloudflare.com"]')]
+    .some(el => !(el instanceof HTMLInputElement) || el.name === 'cf-turnstile-response');
+  if (widget && body().length < 5000
       && !document.querySelector('[name="cf-turnstile-response"]')?.value) return 'cloudflare';
   if (has('#px-captcha')) return 'perimeterx';
   if (/^(robot or human|verify your identity)/i.test(title) && (/\/blocked\b/i.test(location.pathname) || /press\s*(&|and)\s*hold/i.test(body()))) return 'perimeterx';
@@ -155,9 +161,14 @@ const TURNSTILE_JS: &str = r#"(() => {
   if (framed) return Object.assign({kind: 'widget_visible', from: 'iframe'}, framed);
   // 整页验证的主文档里常常只有 0×0 的隐藏字段 cf-chl-widget-xxx_response，量它的父元素：
   // 父元素一般就是挂封闭 shadow root 的容器，勾选框就在里面。
-  // 只对隐藏字段这样做：容器自己 0×0 是控件还没渲染出来，它的父元素可能是整个表单，点上去会误点别的东西
+  // 只对带标准 name 的隐藏字段这样做——和 CHALLENGE_JS 判"是不是拦截页"用的是同一个条件。
+  // dash.cloudflare.com 登录页的隐形 Turnstile 插的是一个**没有 name** 的同名隐藏字段，那只是 token 的落点，
+  // 它的父元素可能是整个登录表单，按它去点就会点在表单上。容器自己 0×0 也不退回父元素：
+  // 那是控件还没渲染出来，不是"藏在父元素里"。
   const hosted = first('.cf-turnstile, [id^="cf-chl-widget"]', el =>
-    box(el) || (el.localName === 'input' && el.parentElement ? box(el.parentElement) : null));
+    box(el) || (el.localName === 'input' && el.name === 'cf-turnstile-response' && el.parentElement
+      ? box(el.parentElement)
+      : null));
   if (hosted) return Object.assign({kind: 'widget_visible', from: 'container'}, hosted);
   if (document.querySelector('.cf-turnstile, [id^="cf-chl-widget"], #challenge-form, #cf-challenge-running')) {
     return {kind: 'widget_hidden'};
@@ -2159,6 +2170,459 @@ const ANNOTATE_ADD: &str = r#"(() => {
 })()"#;
 const ANNOTATE_REMOVE: &str = "document.getElementById('__webctl_overlay')?.remove(); true";
 
+// 点选验证（"请依次点击 A B C"）用的 JS：量出参考条和可点图的视口矩形。
+// 图片不重新下载——见 pick 的注释。
+const PICK_JS: &str = r#"(() => {
+  const img = document.querySelector('.clickableImg');
+  const word = document.querySelector('.word');
+  if (!img || !word) return null;
+  // 参考条和可点图要落在同一张截图里：先把参考条滚到视口中间
+  word.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' });
+  const rect = el => {
+    const b = el.getBoundingClientRect();
+    return { x: b.x, y: b.y, w: b.width, h: b.height };
+  };
+  const bg = el => {
+    const value = getComputedStyle(el).backgroundImage;
+    return value && value !== 'none' ? value : '';
+  };
+  return {
+    img: rect(img),
+    word: rect(word),
+    dpr: window.devicePixelRatio || 1,
+    view: { w: window.innerWidth, h: window.innerHeight },
+    // 判断"点完页面变没变"用的指纹：地址 + 两张图的地址 + 可点图尺寸。
+    // 不放 title：正常页面点一下也可能改标题，会把"还在这一题"误判成换题
+    sig: [location.href, bg(img), bg(word), rect(img).w, rect(img).h].join('\u0001'),
+  };
+})()"#;
+
+/// 黄字是很饱和的纯黄；阈值放低会把日出、黄昏的天空算进来，几个字会被连成一块。
+const PICK_YELLOW: (i32, i32, i32) = (200, 170, 90);
+
+#[derive(Clone, Copy)]
+struct Rect {
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+}
+
+/// 找出点选验证里的候选字：给出视口坐标，并生成一张对照图（上排参考字、下排候选字）。
+///
+/// 图片不重新下载，而是截当前视口、按元素矩形裁：背景图可能在第三方 CDN 上（没有跨域头）、
+/// 可能被 CSP 拦住、也可能是一次性地址，重新取一次会拿到另一张图，算出的坐标和屏幕上那张
+/// 就对不上。截图也省掉了缩放换算和 background-position 的处理——量到多少就是多少。
+///
+/// 认字仍由调用方看对照图完成，这里不猜哪个黄字对应哪个参考字。给了 `click` 就按该顺序点：
+/// 先把所有编号校验一遍（验证码上点错一次可能就用掉一次机会），再逐个点；每次点完比对一次
+/// 页面指纹，换题或跳走就停下，如实报出已经点了哪些、还剩哪些。
+pub fn pick(
+    browser: &mut Browser,
+    out: Option<&Path>,
+    click: Option<&str>,
+    settle: u64,
+    timeout: u64,
+) -> Result<Value> {
+    let session = browser.attach_current()?;
+    // 后台标签页不产生画面，截出来是空白
+    browser
+        .cdp
+        .call("Page.bringToFront", json!({}), Some(&session))?;
+    // 验证码常常是先出容器、隔一会儿才有尺寸（图还没解码完），等一小会儿再量；
+    // 和 turnstile 一样：太早量会误判成"页面不是点选验证"
+    let deadline = Instant::now() + Duration::from_millis(3_000);
+    let mut probe = eval_value(browser, &session, PICK_JS)?;
+    while probe.is_null()
+        || rect_of(&probe["img"]).w <= 0.0
+        || rect_of(&probe["img"]).h <= 0.0
+        || rect_of(&probe["word"]).w <= 0.0
+        || rect_of(&probe["word"]).h <= 0.0
+    {
+        if Instant::now() >= deadline {
+            break;
+        }
+        thread::sleep(Duration::from_millis(150));
+        probe = eval_value(browser, &session, PICK_JS)?;
+    }
+    if probe.is_null() {
+        bail!("当前页面不是点选验证页（没有 .clickableImg / .word）");
+    }
+    let dpr = probe["dpr"].as_f64().filter(|d| *d > 0.0).unwrap_or(1.0);
+    let img = rect_of(&probe["img"]);
+    let refs_rect = rect_of(&probe["word"]);
+    let view_w = probe["view"]["w"].as_f64().unwrap_or(0.0);
+    let view_h = probe["view"]["h"].as_f64().unwrap_or(0.0);
+    if img.w <= 0.0 || img.h <= 0.0 || refs_rect.w <= 0.0 || refs_rect.h <= 0.0 {
+        bail!("验证区域的尺寸是 0，多半还没渲染出来；等页面稳定后重试");
+    }
+    if img.x < 0.0
+        || img.y < 0.0
+        || img.x + img.w > view_w
+        || img.y + img.h > view_h
+        || refs_rect.y < 0.0
+        || refs_rect.y + refs_rect.h > view_h
+    {
+        bail!(
+            "验证区域不在视口内（视口 {view_w}x{view_h}），截不到完整的图；先 `webctl front` 或调整窗口后重试"
+        );
+    }
+
+    let shot = browser.cdp.call(
+        "Page.captureScreenshot",
+        json!({"format": "png"}),
+        Some(&session),
+    )?;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(
+        shot["data"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Chrome 未返回截图数据"))?,
+    )?;
+    let rgb = vision::decode_png_rgb(&bytes)?;
+    let click_area = crop(&rgb, img, dpr)?;
+    let refs_area = crop(&rgb, refs_rect, dpr)?;
+
+    let (cw, ch) = (click_area.width() as usize, click_area.height() as usize);
+    let mask = yellow_mask(&click_area);
+    let raw = vision::label_boxes(&mask, cw, ch, min_blob(dpr));
+    let cap = (vision::median_side(&raw) * 2.0).max(20.0);
+    let boxes = vision::merge_boxes(raw, gap_px(dpr), cap);
+    let segments = ref_segments(&refs_area, dpr);
+
+    let candidates: Vec<Value> = boxes
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            let cx = (b[0] + b[2]) as f64 / 2.0 / dpr + img.x;
+            let cy = (b[1] + b[3]) as f64 / 2.0 / dpr + img.y;
+            json!({
+                "id": format!("C{}", i + 1),
+                "x": (cx * 100.0).round() / 100.0,
+                "y": (cy * 100.0).round() / 100.0,
+                // 相对可点图左上角的 CSS 像素，方便核对
+                "src": [
+                    ((b[0] as f64) / dpr).round(),
+                    ((b[1] as f64) / dpr).round(),
+                    ((b[2] as f64) / dpr).round(),
+                    ((b[3] as f64) / dpr).round(),
+                ],
+            })
+        })
+        .collect();
+
+    let mut output = Map::new();
+    output.insert("ok".to_owned(), json!(true));
+    output.insert("candidates".to_owned(), Value::Array(candidates.clone()));
+    output.insert("refs".to_owned(), json!(segments.len()));
+    if let Some(path) = out {
+        let (mw, mh, buf) = montage(&click_area, &refs_area, &segments, &boxes);
+        write_rgb_png(path, mw, mh, &buf)?;
+        output.insert("montage".to_owned(), json!(path.display().to_string()));
+    }
+    let mut warnings = Vec::new();
+    if segments.len() != 3 || boxes.len() != 3 {
+        warnings.push(format!(
+            "应该是 3 个参考字、3 个候选字，实际分出 {} 个和 {} 个",
+            segments.len(),
+            boxes.len()
+        ));
+    }
+    if let Some((narrow, wide)) = uneven_widths(&segments) {
+        warnings.push(format!(
+            "参考字分段宽度差得多（{narrow} 到 {wide} 像素）：可能不是 3 个字，或者切错了，先看对照图再点"
+        ));
+    }
+    output.insert("warnings".to_owned(), json!(warnings));
+
+    if let Some(order) = click {
+        let ids: Vec<String> = order
+            .split(',')
+            .map(|id| id.trim().to_uppercase())
+            .filter(|id| !id.is_empty())
+            .collect();
+        if ids.is_empty() {
+            bail!("--click 后面没有编号，例如 --click C2,C1,C3");
+        }
+        // 先全部校验：点错一次可能就用掉一次验证机会。
+        // 同一个编号点两下不会是对的：题目里有重复的字时，图上也是两个候选、两个编号
+        for (i, id) in ids.iter().enumerate() {
+            if !candidates.iter().any(|c| c["id"] == json!(id)) {
+                bail!("候选里没有 {id}；先不带 --click 跑一次看候选");
+            }
+            if ids[..i].contains(id) {
+                bail!("{id} 重复了：每个候选只能点一次");
+            }
+        }
+        let before = probe["sig"].as_str().unwrap_or_default().to_owned();
+        let mut clicked = Vec::new();
+        let mut remaining: Vec<String> = Vec::new();
+        let mut last_changes = Value::Null;
+        let mut failure: Option<String> = None;
+        for (index, id) in ids.iter().enumerate() {
+            let candidate = candidates
+                .iter()
+                .find(|c| c["id"] == json!(id))
+                .cloned()
+                .unwrap_or(Value::Null);
+            let x = candidate["x"].as_f64().unwrap_or(0.0);
+            let y = candidate["y"].as_f64().unwrap_or(0.0);
+            match click_at(browser, x, y, false, false, None, settle, timeout) {
+                Ok(result) => {
+                    last_changes = result["changes"].clone();
+                    clicked.push(json!({"id": id, "x": x, "y": y}));
+                }
+                Err(error) => {
+                    failure = Some(format!("点击 {id} 失败：{error}"));
+                    remaining.extend(ids[index..].iter().cloned());
+                    break;
+                }
+            }
+            // 点完看页面变没变：换题或跳走就停下，别拿旧坐标继续点
+            let after = eval_value(browser, &session, PICK_JS).unwrap_or(Value::Null);
+            if after.is_null() || after["sig"].as_str().unwrap_or_default() != before {
+                remaining.extend(ids[index + 1..].iter().cloned());
+                break;
+            }
+        }
+        output.insert("clicked".to_owned(), Value::Array(clicked));
+        output.insert("remaining".to_owned(), json!(remaining));
+        // 顶层带 changes：命令日志靠它记 pick 有没有跳转
+        output.insert("changes".to_owned(), last_changes);
+        if let Some(error) = failure {
+            output.insert("ok".to_owned(), json!(false));
+            output.insert("error".to_owned(), json!(error));
+        }
+    }
+    Ok(Value::Object(output))
+}
+
+fn rect_of(value: &Value) -> Rect {
+    Rect {
+        x: value["x"].as_f64().unwrap_or(0.0),
+        y: value["y"].as_f64().unwrap_or(0.0),
+        w: value["w"].as_f64().unwrap_or(0.0),
+        h: value["h"].as_f64().unwrap_or(0.0),
+    }
+}
+
+/// 按视口矩形从截图里裁一块。截图是设备像素，坐标要乘 dpr。
+fn crop(rgb: &image::RgbImage, r: Rect, dpr: f64) -> Result<image::RgbImage> {
+    let (max_w, max_h) = (rgb.width() as f64, rgb.height() as f64);
+    let x0 = (r.x * dpr).round().clamp(0.0, max_w) as u32;
+    let y0 = (r.y * dpr).round().clamp(0.0, max_h) as u32;
+    let x1 = ((r.x + r.w) * dpr).round().clamp(0.0, max_w) as u32;
+    let y1 = ((r.y + r.h) * dpr).round().clamp(0.0, max_h) as u32;
+    if x1 <= x0 || y1 <= y0 {
+        bail!("验证区域超出了截图范围（元素被裁掉了一部分？）");
+    }
+    Ok(image::imageops::crop_imm(rgb, x0, y0, x1 - x0, y1 - y0).to_image())
+}
+
+fn yellow_mask(img: &image::RgbImage) -> Vec<f32> {
+    let (r_lo, g_lo, b_hi) = PICK_YELLOW;
+    img.pixels()
+        .map(|px| {
+            let (r, g, b) = (px[0] as i32, px[1] as i32, px[2] as i32);
+            if r > r_lo && g > g_lo && b < b_hi {
+                1.0
+            } else {
+                0.0
+            }
+        })
+        .collect()
+}
+
+/// 小于这个像素数的连通域当噪点。定得低一点：偏旁的点画会在合并阶段拼回去，
+/// 过滤太狠会让字的中心偏掉、对照图也缺笔画。
+fn min_blob(dpr: f64) -> usize {
+    (20.0 * dpr * dpr).round().max(4.0) as usize
+}
+
+/// 碎块之间隔多远还算同一个字。跟着 dpr 走。
+fn gap_px(dpr: f64) -> usize {
+    (4.0 * dpr).round().max(2.0) as usize
+}
+
+/// 参考字的分段：先按"连续空白列"切。字距不一定均匀、条上还可能有边框或分隔线，
+/// 直接按宽度三等分既会切歪，也会把最后一个字的右边缘切掉。
+///
+/// 空白列不一定够用：字挨得太紧时切不开（少于 3 段），偏旁之间有空隙时又会切碎（多于 3 段）。
+/// 于是两种兜底：多了就把间隔最小的相邻段并掉，少了就退回等分。
+fn ref_segments(img: &image::RgbImage, dpr: f64) -> Vec<(usize, usize)> {
+    let w = img.width() as usize;
+    let mut cols = vec![0usize; w];
+    for (x, _, px) in img.enumerate_pixels() {
+        if px[0] as u32 + px[1] as u32 + (px[2] as u32) < 320 {
+            cols[x as usize] += 1;
+        }
+    }
+    let min_gap = (3.0 * dpr).round().max(2.0) as usize;
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    let mut start: Option<usize> = None;
+    let mut blank = 0usize;
+    for (x, &count) in cols.iter().enumerate() {
+        if count > 0 {
+            if start.is_none() {
+                start = Some(x);
+            }
+            blank = 0;
+            continue;
+        }
+        if let Some(from) = start {
+            blank += 1;
+            if blank >= min_gap {
+                let end = x + 1 - blank;
+                if end > from + 2 {
+                    out.push((from, end));
+                }
+                start = None;
+                blank = 0;
+            }
+        }
+    }
+    if let Some(from) = start
+        && w > from + 2
+    {
+        out.push((from, w));
+    }
+
+    // 偏旁之间的空隙会被切碎：把间隔最小的相邻段并回去，直到 3 段
+    while out.len() > 3 {
+        let gaps: Vec<usize> = out
+            .windows(2)
+            .map(|pair| pair[1].0.saturating_sub(pair[0].1))
+            .collect();
+        let best = gaps
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, gap)| **gap)
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        let merged = (out[best].0, out[best + 1].1);
+        out.splice(best..best + 2, [merged]);
+    }
+
+    // 字挨得紧、一个空白列都没有：退回等分（有边界问题，但总比少报一个字强）
+    if out.len() < 3 {
+        let (lo, hi) = match (out.first(), out.last()) {
+            (Some(first), Some(last)) => (first.0, last.1),
+            _ => {
+                let nz: Vec<usize> = (0..w).filter(|x| cols[*x] > 0).collect();
+                match (nz.first(), nz.last()) {
+                    (Some(lo), Some(hi)) => (*lo, hi + 1),
+                    _ => return Vec::new(),
+                }
+            }
+        };
+        if hi <= lo + 2 {
+            return out;
+        }
+        let step = (hi - lo) as f64 / 3.0;
+        out = (0..3)
+            .map(|i| {
+                (
+                    lo + (step * i as f64).round() as usize,
+                    lo + (step * (i + 1) as f64).round() as usize,
+                )
+            })
+            .collect();
+    }
+    out
+}
+
+/// 参考字是同一种字体的方块字，宽度差不多。分出来的段宽度相差超过 1.5 倍，
+/// 多半是字数不是 3（两个字被并成了一段）或者切错了，返回 (最窄, 最宽)。
+fn uneven_widths(segments: &[(usize, usize)]) -> Option<(usize, usize)> {
+    let widths = segments.iter().map(|(x0, x1)| x1 - x0);
+    let (narrow, wide) = (widths.clone().min()?, widths.max()?);
+    (wide * 2 > narrow * 3).then_some((narrow, wide))
+}
+
+/// 对照图里每个字放大到 PICK_CELL 见方，四周留 PICK_PAD
+const PICK_CELL: usize = 150;
+const PICK_PAD: usize = 8;
+
+/// 对照图：上排参考字、下排候选字。
+fn montage(
+    click_area: &image::RgbImage,
+    refs_area: &image::RgbImage,
+    segments: &[(usize, usize)],
+    boxes: &[[usize; 4]],
+) -> (usize, usize, Vec<u8>) {
+    let cols = 3.max(segments.len()).max(boxes.len());
+    let cw = cols * (PICK_CELL + 2 * PICK_PAD) + PICK_PAD;
+    let ch = 2 * (PICK_CELL + 2 * PICK_PAD) + PICK_PAD;
+    let mut buf = vec![252u8; cw * ch * 3];
+    for (i, (x0, x1)) in segments.iter().enumerate() {
+        paste_scaled(
+            &mut buf,
+            cw,
+            refs_area,
+            (*x0, 0, *x1, refs_area.height() as usize),
+            i,
+            0,
+        );
+    }
+    for (i, b) in boxes.iter().enumerate() {
+        paste_scaled(
+            &mut buf,
+            cw,
+            click_area,
+            (
+                b[0].saturating_sub(3),
+                b[1].saturating_sub(3),
+                (b[2] + 3).min(click_area.width() as usize),
+                (b[3] + 3).min(click_area.height() as usize),
+            ),
+            i,
+            1,
+        );
+    }
+    (cw, ch, buf)
+}
+
+fn paste_scaled(
+    canvas: &mut [u8],
+    cw: usize,
+    src: &image::RgbImage,
+    crop: (usize, usize, usize, usize),
+    col: usize,
+    row: usize,
+) {
+    let (x0, y0, x1, y1) = crop;
+    let (sw, sh) = (x1.saturating_sub(x0), y1.saturating_sub(y0));
+    if sw == 0 || sh == 0 {
+        return;
+    }
+    let k = (PICK_CELL as f64 / sw as f64).min(PICK_CELL as f64 / sh as f64);
+    let (dw, dh) = ((sw as f64 * k) as usize, (sh as f64 * k) as usize);
+    let ox = PICK_PAD + col * (PICK_CELL + 2 * PICK_PAD) + (PICK_CELL - dw) / 2;
+    let oy = PICK_PAD + row * (PICK_CELL + 2 * PICK_PAD) + (PICK_CELL - dh) / 2;
+    for y in 0..dh {
+        for x in 0..dw {
+            let sx = x0 + x * sw / dw.max(1);
+            let sy = y0 + y * sh / dh.max(1);
+            let px = src.get_pixel(sx as u32, sy as u32);
+            let i = ((oy + y) * cw + ox + x) * 3;
+            if i + 2 < canvas.len() {
+                canvas[i..i + 3].copy_from_slice(&px.0[..3]);
+            }
+        }
+    }
+}
+
+fn write_rgb_png(path: &Path, w: usize, h: usize, rgb: &[u8]) -> Result<()> {
+    let file = fs::File::create(path).with_context(|| format!("无法写入 {}", path.display()))?;
+    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), w as u32, h as u32);
+    encoder.set_color(png::ColorType::Rgb);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().context("无法写入 PNG 头")?;
+    writer.write_image_data(rgb).context("无法写入 PNG 数据")?;
+    // finish 会刷出缓冲并写 IEND：不调用的话写入出错会被吞掉，盘满时留下半张图
+    writer.finish().context("无法收尾 PNG")?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2241,5 +2705,24 @@ mod tests {
                 && !local.contains("%3F"),
             "{local}"
         );
+    }
+
+    #[test]
+    fn flags_ref_bar_with_four_characters() {
+        // 白底参考条上画几个 30 像素宽的黑块当字，块间隔 20 像素
+        let bar = |blocks: usize| {
+            image::RgbImage::from_fn(200, 30, |x, _| {
+                let x = x as usize;
+                let inked = x >= 10 && (x - 10) % 50 < 30 && (x - 10) / 50 < blocks;
+                image::Rgb(if inked { [0, 0, 0] } else { [255, 255, 255] })
+            })
+        };
+        let three = ref_segments(&bar(3), 1.0);
+        assert_eq!(three, [(10, 40), (60, 90), (110, 140)]);
+        assert_eq!(uneven_widths(&three), None);
+        // 4 个字会被并成 3 段，其中一段是两个字：段数看不出来，宽度看得出来
+        let four = ref_segments(&bar(4), 1.0);
+        assert_eq!(four.len(), 3, "{four:?}");
+        assert_eq!(uneven_widths(&four), Some((30, 80)), "{four:?}");
     }
 }

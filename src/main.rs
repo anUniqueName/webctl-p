@@ -252,6 +252,21 @@ enum Command {
         #[arg(long, default_value_t = 3)]
         max: usize,
     },
+    /// 点选验证：找出图上的候选字，输出视口坐标和对照图；给 --click 时按顺序点
+    ///
+    /// 认字由调用方看对照图完成——这里只按颜色分出候选字、把参考字放大并排在一起。
+    Pick {
+        /// 对照图输出路径（上排参考字、下排候选字）
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// 按这个顺序点击候选，如 C2,C1,C3
+        #[arg(long)]
+        click: Option<String>,
+        #[arg(long, default_value_t = 3000)]
+        settle: u64,
+        #[arg(long, default_value_t = 30_000)]
+        timeout: u64,
+    },
     Front,
     /// 列出标签页（序号从 0 开始）
     Tabs,
@@ -552,6 +567,12 @@ fn dispatch(browser: &mut Browser, command: Command) -> Result<Output> {
             settle,
             timeout,
         } => page::click_at(browser, x, y, right, double_click, hold, settle, timeout)?,
+        Command::Pick {
+            out,
+            click,
+            settle,
+            timeout,
+        } => page::pick(browser, out.as_deref(), click.as_deref(), settle, timeout)?,
         Command::Drag {
             x1,
             y1,

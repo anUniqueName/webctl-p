@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8">
+  <title>pick reset fixture</title>
+  <style>
+    body { margin: 0; font-family: "Microsoft YaHei", sans-serif; }
+    .wrap { position: absolute; left: 40px; top: 40px; }
+    .word { width: 120px; height: 40px; background-repeat: no-repeat; background-position: 50% 100%; }
+    .clickableImg { width: 340px; height: 200px; background-repeat: no-repeat; background-position: 50% 0%; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="word"></div>
+    <div class="clickableImg"></div>
+  </div>
+  <script>
+    // 和 pick.html 同一张图，但点一下就把背景图换掉——相当于验证码换题。
+    // pick --click 点完第一下应该发现页面变了，停下，把剩下没点的报出来。
+    function draw(tint) {
+      const c = document.createElement('canvas');
+      c.width = 340; c.height = 240;
+      const g = c.getContext('2d');
+      const sky = g.createLinearGradient(0, 0, 0, 200);
+      sky.addColorStop(0, tint);
+      sky.addColorStop(1, '#2f4a63');
+      g.fillStyle = sky;
+      g.fillRect(0, 0, 340, 200);
+      g.fillStyle = '#ffd400';
+      g.font = 'bold 40px "Microsoft YaHei", sans-serif';
+      g.textBaseline = 'middle';
+      g.fillText('稀', 30, 45);
+      g.fillText('调', 130, 120);
+      g.fillText('帧', 250, 60);
+      g.fillStyle = '#ffffff';
+      g.fillRect(0, 200, 340, 40);
+      g.fillStyle = '#111111';
+      g.font = 'bold 28px "Microsoft YaHei", sans-serif';
+      g.fillText('稀调帧', 120, 222);
+      return c.toDataURL();
+    }
+
+    const first = `url(${draw('#7fa8c9')})`;
+    const second = `url(${draw('#c97f7f')})`;
+    const word = document.querySelector('.word');
+    const img = document.querySelector('.clickableImg');
+    word.style.backgroundImage = first;
+    img.style.backgroundImage = first;
+
+    img.addEventListener('click', () => {
+      // 换题：两张图的地址都变
+      word.style.backgroundImage = second;
+      img.style.backgroundImage = second;
+    });
+  </script>
+</body>
+</html>

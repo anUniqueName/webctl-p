@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8">
+  <title>pick scroll fixture</title>
+  <style>
+    /* 站点开了平滑滚动：pick 把参考条滚到视口中间时，滚动是动画，
+       量位置和截图必须在滚完之后，否则坐标会差出一大截 */
+    html { scroll-behavior: smooth; }
+    body { margin: 0; font-family: "Microsoft YaHei", sans-serif; }
+    .spacer { height: 1200px; }
+    .wrap { margin-left: 40px; }
+    .word { width: 120px; height: 40px; background-repeat: no-repeat; background-position: 50% 100%; }
+    .clickableImg { width: 340px; height: 200px; background-repeat: no-repeat; background-position: 50% 0%; }
+  </style>
+</head>
+<body>
+  <div class="spacer"></div>
+  <div class="wrap">
+    <div class="word"></div>
+    <div class="clickableImg"></div>
+  </div>
+  <div class="spacer"></div>
+  <script>
+    // 和 pick.html 同一张图
+    const c = document.createElement('canvas');
+    c.width = 340; c.height = 240;
+    const g = c.getContext('2d');
+
+    const sky = g.createLinearGradient(0, 0, 0, 200);
+    sky.addColorStop(0, '#7fa8c9');
+    sky.addColorStop(1, '#2f4a63');
+    g.fillStyle = sky;
+    g.fillRect(0, 0, 340, 200);
+
+    g.fillStyle = '#ffd400';
+    g.font = 'bold 40px "Microsoft YaHei", sans-serif';
+    g.textBaseline = 'middle';
+    g.fillText('稀', 30, 45);
+    g.fillText('调', 130, 120);
+    g.fillText('帧', 250, 60);
+
+    g.fillStyle = '#ffffff';
+    g.fillRect(0, 200, 340, 40);
+    g.fillStyle = '#111111';
+    g.font = 'bold 28px "Microsoft YaHei", sans-serif';
+    g.fillText('稀调帧', 120, 222);
+
+    const url = `url(${c.toDataURL()})`;
+    document.querySelector('.word').style.backgroundImage = url;
+    document.querySelector('.clickableImg').style.backgroundImage = url;
+
+    // 先瞬时滚到"验证码贴着视口顶部"：整块可见，但不在中间，pick 会再滚一次
+    const top0 = document.querySelector('.word').getBoundingClientRect().top + scrollY - 10;
+    window.scrollTo({ top: top0, behavior: 'instant' });
+
+    window.webctlClicks = [];
+    document.querySelector('.clickableImg').addEventListener('click', ev => {
+      const r = ev.currentTarget.getBoundingClientRect();
+      window.webctlClicks.push({
+        x: Math.round(ev.clientX - r.left),
+        y: Math.round(ev.clientY - r.top),
+      });
+    });
+  </script>
+</body>
+</html>

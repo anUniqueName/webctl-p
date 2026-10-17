@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Cloudflare Dashboard | Manage Your Account</title>
+</head>
+<body>
+  <!-- 仿 dash.cloudflare.com/login：正文很短，页面里只有一个隐形 Turnstile 的隐藏响应字段。
+       这是正常页面，不是拦截页，webctl 不能报 blocked -->
+  <h1>Sign in to Cloudflare</h1>
+  <form>
+    <label>Email <input type="email" name="email"></label>
+    <label>Password <input type="password" name="password"></label>
+    <button type="submit">Sign in</button>
+  </form>
+  <input type="hidden" id="cf-chl-widget-abc123_response" style="display:none">
+</body>
+</html>

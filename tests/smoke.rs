@@ -783,6 +783,130 @@ fn chrome_smoke() {
         "{akamai}"
     );
 
+    // 页面里只有隐形的 Turnstile 隐藏响应字段时不算拦截：Cloudflare 登录页这类正常页面
+    // 正文很短，只看选择器命中会误报（登录框本身可以正常读写）
+    let invisible = root.join("tests/turnstile-invisible.html");
+    let login_like = json(&home, &["open", &invisible.to_string_lossy()]);
+    assert!(
+        login_like["blocked"].is_null(),
+        "只有隐藏的 Turnstile 字段时不应判成拦截页：{login_like}"
+    );
+
+    // 反过来：容器已经插进页面、但还没撑开（0×0）时仍然是拦截页，不能按渲染尺寸过滤掉
+    let unrendered = root.join("tests/turnstile-unrendered.html");
+    let unrendered_page = json(&home, &["open", &unrendered.to_string_lossy()]);
+    assert_eq!(
+        unrendered_page["blocked"], "cloudflare",
+        "控件容器还没撑开也要认得出拦截页：{unrendered_page}"
+    );
+
+    // 点选验证：pick 要给出视口坐标（夹具把图放在 40,40，源图坐标必须加上这个偏移）、
+    // 能写出对照图，并能按给定顺序点击
+    let pick_page = root.join("tests/pick.html");
+    let opened_pick = json(&home, &["open", &pick_page.to_string_lossy()]);
+    assert_eq!(opened_pick["ok"], true, "{opened_pick}");
+    let montage = home.join("pick-montage.png");
+    let picked = json(&home, &["pick", "--out", &montage.to_string_lossy()]);
+    let candidates = picked["candidates"].as_array().cloned().unwrap_or_default();
+    assert_eq!(candidates.len(), 3, "应认出三个候选字：{picked}");
+    assert_eq!(picked["refs"], 3, "参考条也要分出三个字：{picked}");
+    assert!(montage.exists(), "对照图没写出来：{picked}");
+    assert_eq!(
+        picked["warnings"],
+        serde_json::json!([]),
+        "正常的三个字不该有警告：{picked}"
+    );
+    for candidate in &candidates {
+        let src = candidate["src"].as_array().unwrap();
+        let cx = (src[0].as_f64().unwrap() + src[2].as_f64().unwrap()) / 2.0;
+        let cy = (src[1].as_f64().unwrap() + src[3].as_f64().unwrap()) / 2.0;
+        let x = candidate["x"].as_f64().unwrap();
+        let y = candidate["y"].as_f64().unwrap();
+        assert!(
+            (x - (40.0 + cx)).abs() < 1.5 && (y - (80.0 + cy)).abs() < 1.5,
+            "候选坐标要是视口坐标（.wrap 在 40,40，.word 占 40 高，图从 y=80 起）：{candidate}"
+        );
+    }
+    let clicked_pick = json(&home, &["pick", "--click", "C1,C2,C3", "--settle", "300"]);
+    assert_eq!(
+        clicked_pick["clicked"].as_array().map(|c| c.len()),
+        Some(3),
+        "{clicked_pick}"
+    );
+    let title = json(&home, &["eval", "document.title"]);
+    assert_eq!(
+        title["result"].as_str(),
+        Some("pick clicked 3"),
+        "三次点击都要落到可点区域上：{title}"
+    );
+    // 编号写错时一个都不能点：验证码点错一次可能就用掉一次机会
+    let rejected = run(&home, &["pick", "--click", "C1,C9,C3"]);
+    assert!(!rejected.status.success(), "编号不存在时要直接报错");
+    let rejected_err = String::from_utf8_lossy(&rejected.stderr);
+    assert!(rejected_err.contains("C9"), "{rejected_err}");
+    let duplicated = run(&home, &["pick", "--click", "C1,C2,C2"]);
+    assert!(!duplicated.status.success(), "同一个编号写两次要直接报错");
+    let after_reject = json(&home, &["eval", "document.title"]);
+    assert_eq!(
+        after_reject["result"].as_str(),
+        Some("pick clicked 3"),
+        "校验没过时不该发出任何点击：{after_reject}"
+    );
+
+    // 点一下就把题换掉（相当于验证码刷新）：要停下来，别拿旧坐标继续点
+    let reset_page = root.join("tests/pick-reset.html");
+    json(&home, &["open", &reset_page.to_string_lossy()]);
+    let stopped = json(&home, &["pick", "--click", "C1,C2,C3", "--settle", "300"]);
+    assert_eq!(
+        stopped["clicked"].as_array().map(|c| c.len()),
+        Some(1),
+        "第一下点完页面变了就该停：{stopped}"
+    );
+    let remaining: Vec<&str> = stopped["remaining"]
+        .as_array()
+        .map(|list| list.iter().filter_map(|id| id.as_str()).collect())
+        .unwrap_or_default();
+    assert_eq!(remaining, ["C2", "C3"], "没点的要如实报出来：{stopped}");
+
+    // 点一下就跳到没有验证码的页面：同样要停下，不能在新页面上接着点
+    let leave_page = root.join("tests/pick-leave.html");
+    json(&home, &["open", &leave_page.to_string_lossy()]);
+    let left = json(&home, &["pick", "--click", "C1,C2,C3", "--settle", "300"]);
+    assert_eq!(
+        left["clicked"].as_array().map(|c| c.len()),
+        Some(1),
+        "跳走之后就该停：{left}"
+    );
+    assert_eq!(left["remaining"], serde_json::json!(["C2", "C3"]), "{left}");
+
+    // 站点开了平滑滚动、验证码不在视口中间：pick 自己滚动之后再量再截，点击要落在字上
+    let scroll_page = root.join("tests/pick-scroll.html");
+    json(&home, &["open", &scroll_page.to_string_lossy()]);
+    let scrolled = json(&home, &["pick", "--click", "C1,C2,C3", "--settle", "300"]);
+    let landed = json(&home, &["eval", "JSON.stringify(window.webctlClicks)"]);
+    let landed: Vec<Value> =
+        serde_json::from_str(landed["result"].as_str().unwrap_or("[]")).unwrap_or_default();
+    let clicked = scrolled["clicked"].as_array().cloned().unwrap_or_default();
+    assert_eq!(
+        landed.len(),
+        3,
+        "三下都要落在可点图上：{scrolled} / {landed:?}"
+    );
+    for (click, at) in clicked.iter().zip(&landed) {
+        let candidate = scrolled["candidates"]
+            .as_array()
+            .and_then(|list| list.iter().find(|c| c["id"] == click["id"]))
+            .unwrap_or_else(|| panic!("{scrolled}"));
+        let src = candidate["src"].as_array().unwrap();
+        let cx = (src[0].as_f64().unwrap() + src[2].as_f64().unwrap()) / 2.0;
+        let cy = (src[1].as_f64().unwrap() + src[3].as_f64().unwrap()) / 2.0;
+        assert!(
+            (at["x"].as_f64().unwrap() - cx).abs() < 2.0
+                && (at["y"].as_f64().unwrap() - cy).abs() < 2.0,
+            "点击要落在候选字中心（相对可点图）：{click} 落在 {at}，候选 {candidate}"
+        );
+    }
+
     // fixture 里有一个 display:none 的 captcha 容器，文字是"拖动"：没渲染出来的不算拼图验证页
     let normal = json(&home, &["open", &fixture_text]);
     assert!(normal["blocked"].is_null(), "正常页面不该报拦截：{normal}");

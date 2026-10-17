@@ -35,10 +35,11 @@ pub struct Image {
     pub alpha: Option<Vec<u8>>,
 }
 
+const PNG_MAGIC: &[u8] = b"\x89PNG";
+
 /// 解码 PNG/JPEG/WebP 并转成灰度，保留 alpha 通道（有的话）。
 /// PNG 走内置解码器，其余格式用 image crate。
 pub fn decode_image(bytes: &[u8]) -> Result<Image> {
-    const PNG_MAGIC: &[u8] = b"\x89PNG";
     if bytes.starts_with(PNG_MAGIC) {
         return decode_png_rgba(bytes);
     }
@@ -66,26 +67,28 @@ pub fn decode_image(bytes: &[u8]) -> Result<Image> {
     })
 }
 
-/// PNG 解码，比 decode_png 多保留 alpha 通道
-fn decode_png_rgba(bytes: &[u8]) -> Result<Image> {
+/// PNG 解成 8bit 通道，返回 (宽, 高, 每像素通道数, 像素)。通道数 1 灰度、2 灰度+alpha、3 RGB、4 RGBA
+fn png_pixels(bytes: &[u8]) -> Result<(usize, usize, usize, Vec<u8>)> {
     let mut decoder = png::Decoder::new(bytes);
     // EXPAND 把调色板/低位深展开成 8bit 通道，STRIP_16 把 16bit 砍成 8bit
     decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
     let mut reader = decoder.read_info().context("无法解析 PNG 头")?;
     let mut buf = vec![0; reader.output_buffer_size()];
     let info = reader.next_frame(&mut buf).context("无法解码 PNG 像素")?;
-    let data = &buf[..info.buffer_size()];
-    let (width, height) = (info.width as usize, info.height as usize);
+    buf.truncate(info.buffer_size());
     let channels = match info.color_type {
         png::ColorType::Grayscale => 1,
         png::ColorType::GrayscaleAlpha => 2,
         png::ColorType::Rgb | png::ColorType::Indexed => 3,
         png::ColorType::Rgba => 4,
     };
-    let has_alpha = matches!(
-        info.color_type,
-        png::ColorType::GrayscaleAlpha | png::ColorType::Rgba
-    );
+    Ok((info.width as usize, info.height as usize, channels, buf))
+}
+
+/// PNG 解码，比 decode_png 多保留 alpha 通道
+fn decode_png_rgba(bytes: &[u8]) -> Result<Image> {
+    let (width, height, channels, data) = png_pixels(bytes)?;
+    let has_alpha = matches!(channels, 2 | 4);
     let mut gray = vec![0u8; width * height];
     let mut alpha = vec![0u8; width * height];
     let mut any_transparent = false;
@@ -647,6 +650,114 @@ impl Integral {
             self.sq[d] - self.sq[b] - self.sq[c] + self.sq[a],
         )
     }
+}
+
+/// 解码 PNG 截图成 RGB（丢掉 alpha），给要看颜色的 `pick` 用
+pub fn decode_png_rgb(bytes: &[u8]) -> Result<image::RgbImage> {
+    let (width, height, channels, data) = png_pixels(bytes)?;
+    let rgb = data
+        .chunks_exact(channels)
+        .flat_map(|p| {
+            if channels <= 2 {
+                [p[0]; 3]
+            } else {
+                [p[0], p[1], p[2]]
+            }
+        })
+        .collect();
+    image::RgbImage::from_raw(width as u32, height as u32, rgb)
+        .ok_or_else(|| anyhow::anyhow!("图片尺寸异常"))
+}
+
+/// 4 邻域连通域，返回 [x0, y0, x1, y1]（含端点），先上后下再左到右。
+/// 和 `components` 的区别：不做 300 像素的下限、也不截断像素列表——偏旁的点画要先留下来，
+/// 交给 `merge_boxes` 拼回整字。
+pub fn label_boxes(mask: &[f32], width: usize, height: usize, min_px: usize) -> Vec<[usize; 4]> {
+    let mut seen = vec![false; width * height];
+    let mut out = Vec::new();
+    for start in 0..width * height {
+        if seen[start] || mask[start] <= 0.0 {
+            continue;
+        }
+        seen[start] = true;
+        let mut stack = vec![start];
+        let (mut x0, mut y0, mut x1, mut y1) = (width, height, 0usize, 0usize);
+        let mut count = 0usize;
+        while let Some(i) = stack.pop() {
+            let (x, y) = (i % width, i / width);
+            x0 = x0.min(x);
+            x1 = x1.max(x);
+            y0 = y0.min(y);
+            y1 = y1.max(y);
+            count += 1;
+            for next in [
+                (x > 0).then(|| i - 1),
+                (x + 1 < width).then(|| i + 1),
+                (y > 0).then(|| i - width),
+                (y + 1 < height).then(|| i + width),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if !seen[next] && mask[next] > 0.0 {
+                    seen[next] = true;
+                    stack.push(next);
+                }
+            }
+        }
+        if count >= min_px {
+            out.push([x0, y0, x1, y1]);
+        }
+    }
+    out.sort_by_key(|b| (b[1] / 40, b[0]));
+    out
+}
+
+/// 一组包围盒的边长中位数：给"合并碎块"定一个跟着字大小走的阈值。
+pub fn median_side(boxes: &[[usize; 4]]) -> f64 {
+    let mut sides: Vec<f64> = boxes
+        .iter()
+        .map(|b| (b[2] - b[0]).max(b[3] - b[1]) as f64)
+        .collect();
+    if sides.is_empty() {
+        return 0.0;
+    }
+    sides.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    sides[sides.len() / 2]
+}
+
+/// 把同一个字的碎块合回一块：挨得够近，且合并后的包围盒不超过 `cap`。
+/// 只看"挨得近"会把斜向相邻的两个字也并进去，所以要卡一下合并后的尺寸。
+pub fn merge_boxes(boxes: Vec<[usize; 4]>, gap: usize, cap: f64) -> Vec<[usize; 4]> {
+    let mut boxes = boxes;
+    let mut changed = true;
+    while changed {
+        changed = false;
+        'outer: for i in 0..boxes.len() {
+            for j in i + 1..boxes.len() {
+                let (p, q) = (boxes[i], boxes[j]);
+                if p[2] + gap < q[0] || q[2] + gap < p[0] || p[3] + gap < q[1] || q[3] + gap < p[1]
+                {
+                    continue;
+                }
+                let merged = [
+                    p[0].min(q[0]),
+                    p[1].min(q[1]),
+                    p[2].max(q[2]),
+                    p[3].max(q[3]),
+                ];
+                let span = (merged[2] - merged[0]).max(merged[3] - merged[1]) as f64;
+                if span > cap {
+                    continue;
+                }
+                boxes[i] = merged;
+                boxes.remove(j);
+                changed = true;
+                break 'outer;
+            }
+        }
+    }
+    boxes
 }
 
 #[cfg(test)]
