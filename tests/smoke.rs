@@ -834,6 +834,36 @@ fn chrome_smoke() {
         Some("pick clicked 3"),
         "三次点击都要落到可点区域上：{title}"
     );
+    // 编号写错时一个都不能点：验证码点错一次可能就用掉一次机会
+    let rejected = run(&home, &["pick", "--click", "C1,C9,C3"]);
+    assert!(!rejected.status.success(), "编号不存在时要直接报错");
+    let rejected_err = String::from_utf8_lossy(&rejected.stderr);
+    assert!(rejected_err.contains("C9"), "{rejected_err}");
+    let after_reject = json(&home, &["eval", "document.title"]);
+    assert_eq!(
+        after_reject["result"].as_str(),
+        Some("pick clicked 3"),
+        "校验没过时不该发出任何点击：{after_reject}"
+    );
+
+    // 点一下就把题换掉（相当于验证码刷新）：要停下来，别拿旧坐标继续点
+    let reset_page = root.join("tests/pick-reset.html");
+    json(&home, &["open", &reset_page.to_string_lossy()]);
+    let stopped = json(&home, &["pick", "--click", "C1,C2,C3", "--settle", "300"]);
+    assert_eq!(
+        stopped["clicked"].as_array().map(|c| c.len()),
+        Some(1),
+        "第一下点完页面变了就该停：{stopped}"
+    );
+    let remaining: Vec<&str> = stopped["remaining"]
+        .as_array()
+        .map(|list| list.iter().filter_map(|id| id.as_str()).collect())
+        .unwrap_or_default();
+    assert_eq!(
+        remaining,
+        ["C2", "C3"],
+        "没点的要如实报出来：{stopped}"
+    );
 
     // fixture 里有一个 display:none 的 captcha 容器，文字是"拖动"：没渲染出来的不算拼图验证页
     let normal = json(&home, &["open", &fixture_text]);

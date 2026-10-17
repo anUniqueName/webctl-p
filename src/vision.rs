@@ -649,6 +649,136 @@ impl Integral {
     }
 }
 
+/// 把图片解成 RGB。PNG 走内置解码器（`image` 那份没开 png 特性，别为了它多拉一个版本），
+/// 其余格式交给 `image`：`gap`、`find`/`vclick` 的输入要认 JPEG/WebP。
+pub fn decode_rgb(bytes: &[u8]) -> Result<image::RgbImage> {
+    const PNG_MAGIC: &[u8] = b"\x89PNG";
+    if !bytes.starts_with(PNG_MAGIC) {
+        return Ok(image::load_from_memory(bytes)
+            .context("无法解码图片（支持 PNG/JPEG/WebP）")?
+            .to_rgb8());
+    }
+    let mut decoder = png::Decoder::new(bytes);
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = decoder.read_info().context("无法解析 PNG 头")?;
+    let mut buf = vec![0; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).context("无法解码 PNG")?;
+    let pixels = &buf[..info.buffer_size()];
+    let (w, h) = (info.width as usize, info.height as usize);
+    let mut rgb = Vec::with_capacity(w * h * 3);
+    match info.color_type {
+        png::ColorType::Rgb => rgb.extend_from_slice(pixels),
+        png::ColorType::Rgba => {
+            for px in pixels.chunks_exact(4) {
+                rgb.extend_from_slice(&px[..3]);
+            }
+        }
+        png::ColorType::Grayscale => {
+            for &v in pixels {
+                rgb.extend_from_slice(&[v, v, v]);
+            }
+        }
+        png::ColorType::GrayscaleAlpha => {
+            for px in pixels.chunks_exact(2) {
+                rgb.extend_from_slice(&[px[0], px[0], px[0]]);
+            }
+        }
+        png::ColorType::Indexed => anyhow::bail!("不支持的 PNG 调色板格式"),
+    }
+    image::RgbImage::from_raw(w as u32, h as u32, rgb)
+        .ok_or_else(|| anyhow::anyhow!("图片尺寸异常"))
+}
+
+/// 4 邻域连通域，返回 [x0, y0, x1, y1]（含端点），先上后下再左到右。
+/// 和 `components` 的区别：不做 300 像素的下限、也不截断像素列表——偏旁的点画要先留下来，
+/// 交给 `merge_boxes` 拼回整字。
+pub fn label_boxes(mask: &[f32], width: usize, height: usize, min_px: usize) -> Vec<[usize; 4]> {
+    let mut seen = vec![false; width * height];
+    let mut out = Vec::new();
+    for start in 0..width * height {
+        if seen[start] || mask[start] <= 0.0 {
+            continue;
+        }
+        seen[start] = true;
+        let mut stack = vec![start];
+        let (mut x0, mut y0, mut x1, mut y1) = (width, height, 0usize, 0usize);
+        let mut count = 0usize;
+        while let Some(i) = stack.pop() {
+            let (x, y) = (i % width, i / width);
+            x0 = x0.min(x);
+            x1 = x1.max(x);
+            y0 = y0.min(y);
+            y1 = y1.max(y);
+            count += 1;
+            for next in [
+                (x > 0).then(|| i - 1),
+                (x + 1 < width).then(|| i + 1),
+                (y > 0).then(|| i - width),
+                (y + 1 < height).then(|| i + width),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if !seen[next] && mask[next] > 0.0 {
+                    seen[next] = true;
+                    stack.push(next);
+                }
+            }
+        }
+        if count >= min_px {
+            out.push([x0, y0, x1, y1]);
+        }
+    }
+    out.sort_by_key(|b| (b[1] / 40, b[0]));
+    out
+}
+
+/// 一组包围盒的边长中位数：给"合并碎块"定一个跟着字大小走的阈值。
+pub fn median_side(boxes: &[[usize; 4]]) -> f64 {
+    let mut sides: Vec<f64> = boxes
+        .iter()
+        .map(|b| (b[2] - b[0]).max(b[3] - b[1]) as f64)
+        .collect();
+    if sides.is_empty() {
+        return 0.0;
+    }
+    sides.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    sides[sides.len() / 2]
+}
+
+/// 把同一个字的碎块合回一块：挨得够近，且合并后的包围盒不超过 `cap`。
+/// 只看"挨得近"会把斜向相邻的两个字也并进去，所以要卡一下合并后的尺寸。
+pub fn merge_boxes(boxes: Vec<[usize; 4]>, gap: usize, cap: f64) -> Vec<[usize; 4]> {
+    let mut boxes = boxes;
+    let mut changed = true;
+    while changed {
+        changed = false;
+        'outer: for i in 0..boxes.len() {
+            for j in i + 1..boxes.len() {
+                let (p, q) = (boxes[i], boxes[j]);
+                if p[2] + gap < q[0] || q[2] + gap < p[0] || p[3] + gap < q[1] || q[3] + gap < p[1] {
+                    continue;
+                }
+                let merged = [
+                    p[0].min(q[0]),
+                    p[1].min(q[1]),
+                    p[2].max(q[2]),
+                    p[3].max(q[3]),
+                ];
+                let span = (merged[2] - merged[0]).max(merged[3] - merged[1]) as f64;
+                if span > cap {
+                    continue;
+                }
+                boxes[i] = merged;
+                boxes.remove(j);
+                changed = true;
+                break 'outer;
+            }
+        }
+    }
+    boxes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
