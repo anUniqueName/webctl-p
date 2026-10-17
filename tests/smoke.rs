@@ -783,6 +783,23 @@ fn chrome_smoke() {
         "{akamai}"
     );
 
+    // 页面里只有隐形的 Turnstile 隐藏响应字段时不算拦截：Cloudflare 登录页这类正常页面
+    // 正文很短，只看选择器命中会误报（登录框本身可以正常读写）
+    let invisible = root.join("tests/turnstile-invisible.html");
+    let login_like = json(&home, &["open", &invisible.to_string_lossy()]);
+    assert!(
+        login_like["blocked"].is_null(),
+        "只有隐藏的 Turnstile 字段时不应判成拦截页：{login_like}"
+    );
+
+    // 反过来：容器已经插进页面、但还没撑开（0×0）时仍然是拦截页，不能按渲染尺寸过滤掉
+    let unrendered = root.join("tests/turnstile-unrendered.html");
+    let unrendered_page = json(&home, &["open", &unrendered.to_string_lossy()]);
+    assert_eq!(
+        unrendered_page["blocked"], "cloudflare",
+        "控件容器还没撑开也要认得出拦截页：{unrendered_page}"
+    );
+
     // fixture 里有一个 display:none 的 captcha 容器，文字是"拖动"：没渲染出来的不算拼图验证页
     let normal = json(&home, &["open", &fixture_text]);
     assert!(normal["blocked"].is_null(), "正常页面不该报拦截：{normal}");

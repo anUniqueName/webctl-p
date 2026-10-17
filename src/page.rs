@@ -73,8 +73,14 @@ const CHALLENGE_JS: &str = r#"(() => {
   if (has('#challenge-form, #cf-challenge-running')) return 'cloudflare';
   if (/^(just a moment|attention required|checking your browser|请稍候)/i.test(title)) return 'cloudflare';
   // 勾选框控件也可能嵌在正常页面的评论、结账表单里，所以只在正文很短、还没拿到 token 时才算拦截页。
-  // [id^="cf-chl-widget"] 和 turnstile 定位用的是同一个选择器：量得到控件的整页验证，这里也要认得出
-  if (has('.cf-turnstile, [id^="cf-chl-widget"], iframe[src*="challenges.cloudflare.com"]') && body().length < 5000
+  // [id^="cf-chl-widget"] 和 turnstile 定位用的是同一个选择器：量得到控件的整页验证，这里也要认得出。
+  // 但隐藏的 cf-chl-widget-xxx_response input 要分开看：整页验证的主文档里常常只有它（勾选框在它父元素的
+  // 封闭 shadow root 里），它带标准 name，所以仍然算控件；而 dash.cloudflare.com 登录页上那个同名隐藏字段
+  // 没有 name，只是隐形 Turnstile 的落点，算进去会把正常登录页误报成验证页。
+  // 不按"有没有宽高"过滤：拦截页的控件容器常常是先插入、隔一会儿才撑开的 0×0 元素，按渲染尺寸过滤会漏判
+  const widget = [...document.querySelectorAll('.cf-turnstile, [id^="cf-chl-widget"], iframe[src*="challenges.cloudflare.com"]')]
+    .some(el => !(el instanceof HTMLInputElement) || el.name === 'cf-turnstile-response');
+  if (widget && body().length < 5000
       && !document.querySelector('[name="cf-turnstile-response"]')?.value) return 'cloudflare';
   if (has('#px-captcha')) return 'perimeterx';
   if (/^(robot or human|verify your identity)/i.test(title) && (/\/blocked\b/i.test(location.pathname) || /press\s*(&|and)\s*hold/i.test(body()))) return 'perimeterx';
