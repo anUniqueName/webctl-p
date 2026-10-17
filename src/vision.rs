@@ -35,10 +35,11 @@ pub struct Image {
     pub alpha: Option<Vec<u8>>,
 }
 
+const PNG_MAGIC: &[u8] = b"\x89PNG";
+
 /// 解码 PNG/JPEG/WebP 并转成灰度，保留 alpha 通道（有的话）。
 /// PNG 走内置解码器，其余格式用 image crate。
 pub fn decode_image(bytes: &[u8]) -> Result<Image> {
-    const PNG_MAGIC: &[u8] = b"\x89PNG";
     if bytes.starts_with(PNG_MAGIC) {
         return decode_png_rgba(bytes);
     }
@@ -66,26 +67,28 @@ pub fn decode_image(bytes: &[u8]) -> Result<Image> {
     })
 }
 
-/// PNG 解码，比 decode_png 多保留 alpha 通道
-fn decode_png_rgba(bytes: &[u8]) -> Result<Image> {
+/// PNG 解成 8bit 通道，返回 (宽, 高, 每像素通道数, 像素)。通道数 1 灰度、2 灰度+alpha、3 RGB、4 RGBA
+fn png_pixels(bytes: &[u8]) -> Result<(usize, usize, usize, Vec<u8>)> {
     let mut decoder = png::Decoder::new(bytes);
     // EXPAND 把调色板/低位深展开成 8bit 通道，STRIP_16 把 16bit 砍成 8bit
     decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
     let mut reader = decoder.read_info().context("无法解析 PNG 头")?;
     let mut buf = vec![0; reader.output_buffer_size()];
     let info = reader.next_frame(&mut buf).context("无法解码 PNG 像素")?;
-    let data = &buf[..info.buffer_size()];
-    let (width, height) = (info.width as usize, info.height as usize);
+    buf.truncate(info.buffer_size());
     let channels = match info.color_type {
         png::ColorType::Grayscale => 1,
         png::ColorType::GrayscaleAlpha => 2,
         png::ColorType::Rgb | png::ColorType::Indexed => 3,
         png::ColorType::Rgba => 4,
     };
-    let has_alpha = matches!(
-        info.color_type,
-        png::ColorType::GrayscaleAlpha | png::ColorType::Rgba
-    );
+    Ok((info.width as usize, info.height as usize, channels, buf))
+}
+
+/// PNG 解码，比 decode_png 多保留 alpha 通道
+fn decode_png_rgba(bytes: &[u8]) -> Result<Image> {
+    let (width, height, channels, data) = png_pixels(bytes)?;
+    let has_alpha = matches!(channels, 2 | 4);
     let mut gray = vec![0u8; width * height];
     let mut alpha = vec![0u8; width * height];
     let mut any_transparent = false;
@@ -649,43 +652,20 @@ impl Integral {
     }
 }
 
-/// 把图片解成 RGB。PNG 走内置解码器（`image` 那份没开 png 特性，别为了它多拉一个版本），
-/// 其余格式交给 `image`：`gap`、`find`/`vclick` 的输入要认 JPEG/WebP。
-pub fn decode_rgb(bytes: &[u8]) -> Result<image::RgbImage> {
-    const PNG_MAGIC: &[u8] = b"\x89PNG";
-    if !bytes.starts_with(PNG_MAGIC) {
-        return Ok(image::load_from_memory(bytes)
-            .context("无法解码图片（支持 PNG/JPEG/WebP）")?
-            .to_rgb8());
-    }
-    let mut decoder = png::Decoder::new(bytes);
-    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
-    let mut reader = decoder.read_info().context("无法解析 PNG 头")?;
-    let mut buf = vec![0; reader.output_buffer_size()];
-    let info = reader.next_frame(&mut buf).context("无法解码 PNG")?;
-    let pixels = &buf[..info.buffer_size()];
-    let (w, h) = (info.width as usize, info.height as usize);
-    let mut rgb = Vec::with_capacity(w * h * 3);
-    match info.color_type {
-        png::ColorType::Rgb => rgb.extend_from_slice(pixels),
-        png::ColorType::Rgba => {
-            for px in pixels.chunks_exact(4) {
-                rgb.extend_from_slice(&px[..3]);
+/// 解码 PNG 截图成 RGB（丢掉 alpha），给要看颜色的 `pick` 用
+pub fn decode_png_rgb(bytes: &[u8]) -> Result<image::RgbImage> {
+    let (width, height, channels, data) = png_pixels(bytes)?;
+    let rgb = data
+        .chunks_exact(channels)
+        .flat_map(|p| {
+            if channels <= 2 {
+                [p[0]; 3]
+            } else {
+                [p[0], p[1], p[2]]
             }
-        }
-        png::ColorType::Grayscale => {
-            for &v in pixels {
-                rgb.extend_from_slice(&[v, v, v]);
-            }
-        }
-        png::ColorType::GrayscaleAlpha => {
-            for px in pixels.chunks_exact(2) {
-                rgb.extend_from_slice(&[px[0], px[0], px[0]]);
-            }
-        }
-        png::ColorType::Indexed => anyhow::bail!("不支持的 PNG 调色板格式"),
-    }
-    image::RgbImage::from_raw(w as u32, h as u32, rgb)
+        })
+        .collect();
+    image::RgbImage::from_raw(width as u32, height as u32, rgb)
         .ok_or_else(|| anyhow::anyhow!("图片尺寸异常"))
 }
 

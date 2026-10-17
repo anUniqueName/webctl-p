@@ -162,7 +162,7 @@ const TURNSTILE_JS: &str = r#"(() => {
   // 整页验证的主文档里常常只有 0×0 的隐藏字段 cf-chl-widget-xxx_response，量它的父元素：
   // 父元素一般就是挂封闭 shadow root 的容器，勾选框就在里面。
   // 只对带标准 name 的隐藏字段这样做——和 CHALLENGE_JS 判"是不是拦截页"用的是同一个条件。
-  // 隐形 Turnstile 在任何页面都会插一个**没有 name** 的同名隐藏字段，那只是 token 的落点，
+  // dash.cloudflare.com 登录页的隐形 Turnstile 插的是一个**没有 name** 的同名隐藏字段，那只是 token 的落点，
   // 它的父元素可能是整个登录表单，按它去点就会点在表单上。容器自己 0×0 也不退回父元素：
   // 那是控件还没渲染出来，不是"藏在父元素里"。
   const hosted = first('.cf-turnstile, [id^="cf-chl-widget"]', el =>
@@ -2278,7 +2278,7 @@ pub fn pick(
             .as_str()
             .ok_or_else(|| anyhow!("Chrome 未返回截图数据"))?,
     )?;
-    let rgb = vision::decode_rgb(&bytes)?;
+    let rgb = vision::decode_png_rgb(&bytes)?;
     let click_area = crop(&rgb, img, dpr)?;
     let refs_area = crop(&rgb, refs_rect, dpr)?;
 
@@ -2322,9 +2322,14 @@ pub fn pick(
     let mut warnings = Vec::new();
     if segments.len() != 3 || boxes.len() != 3 {
         warnings.push(format!(
-            "expected 3 refs and 3 candidates, got {} and {}",
+            "应该是 3 个参考字、3 个候选字，实际分出 {} 个和 {} 个",
             segments.len(),
             boxes.len()
+        ));
+    }
+    if let Some((narrow, wide)) = uneven_widths(&segments) {
+        warnings.push(format!(
+            "参考字分段宽度差得多（{narrow} 到 {wide} 像素）：可能不是 3 个字，或者切错了，先看对照图再点"
         ));
     }
     output.insert("warnings".to_owned(), json!(warnings));
@@ -2338,10 +2343,14 @@ pub fn pick(
         if ids.is_empty() {
             bail!("--click 后面没有编号，例如 --click C2,C1,C3");
         }
-        // 先全部校验：点错一次可能就用掉一次验证机会
-        for id in &ids {
+        // 先全部校验：点错一次可能就用掉一次验证机会。
+        // 同一个编号点两下不会是对的：题目里有重复的字时，图上也是两个候选、两个编号
+        for (i, id) in ids.iter().enumerate() {
             if !candidates.iter().any(|c| c["id"] == json!(id)) {
                 bail!("候选里没有 {id}；先不带 --click 跑一次看候选");
+            }
+            if ids[..i].contains(id) {
+                bail!("{id} 重复了：每个候选只能点一次");
             }
         }
         let before = probe["sig"].as_str().unwrap_or_default().to_owned();
@@ -2521,24 +2530,33 @@ fn ref_segments(img: &image::RgbImage, dpr: f64) -> Vec<(usize, usize)> {
     out
 }
 
-/// 对照图：上排参考字、下排候选字，各放大到 cell 见方。
+/// 参考字是同一种字体的方块字，宽度差不多。分出来的段宽度相差超过 1.5 倍，
+/// 多半是字数不是 3（两个字被并成了一段）或者切错了，返回 (最窄, 最宽)。
+fn uneven_widths(segments: &[(usize, usize)]) -> Option<(usize, usize)> {
+    let widths = segments.iter().map(|(x0, x1)| x1 - x0);
+    let (narrow, wide) = (widths.clone().min()?, widths.max()?);
+    (wide * 2 > narrow * 3).then_some((narrow, wide))
+}
+
+/// 对照图里每个字放大到 PICK_CELL 见方，四周留 PICK_PAD
+const PICK_CELL: usize = 150;
+const PICK_PAD: usize = 8;
+
+/// 对照图：上排参考字、下排候选字。
 fn montage(
     click_area: &image::RgbImage,
     refs_area: &image::RgbImage,
     segments: &[(usize, usize)],
     boxes: &[[usize; 4]],
 ) -> (usize, usize, Vec<u8>) {
-    const CELL: usize = 150;
-    const PAD: usize = 8;
     let cols = 3.max(segments.len()).max(boxes.len());
-    let cw = cols * (CELL + 2 * PAD) + PAD;
-    let ch = 2 * (CELL + 2 * PAD) + PAD;
+    let cw = cols * (PICK_CELL + 2 * PICK_PAD) + PICK_PAD;
+    let ch = 2 * (PICK_CELL + 2 * PICK_PAD) + PICK_PAD;
     let mut buf = vec![252u8; cw * ch * 3];
     for (i, (x0, x1)) in segments.iter().enumerate() {
         paste_scaled(
             &mut buf,
             cw,
-            ch,
             refs_area,
             (*x0, 0, *x1, refs_area.height() as usize),
             i,
@@ -2549,7 +2567,6 @@ fn montage(
         paste_scaled(
             &mut buf,
             cw,
-            ch,
             click_area,
             (
                 b[0].saturating_sub(3),
@@ -2567,23 +2584,20 @@ fn montage(
 fn paste_scaled(
     canvas: &mut [u8],
     cw: usize,
-    ch: usize,
     src: &image::RgbImage,
     crop: (usize, usize, usize, usize),
     col: usize,
     row: usize,
 ) {
-    const CELL: usize = 150;
-    const PAD: usize = 8;
     let (x0, y0, x1, y1) = crop;
     let (sw, sh) = (x1.saturating_sub(x0), y1.saturating_sub(y0));
     if sw == 0 || sh == 0 {
         return;
     }
-    let k = (CELL as f64 / sw as f64).min(CELL as f64 / sh as f64);
+    let k = (PICK_CELL as f64 / sw as f64).min(PICK_CELL as f64 / sh as f64);
     let (dw, dh) = ((sw as f64 * k) as usize, (sh as f64 * k) as usize);
-    let ox = PAD + col * (CELL + 2 * PAD) + (CELL - dw) / 2;
-    let oy = PAD + row * (CELL + 2 * PAD) + (CELL - dh) / 2;
+    let ox = PICK_PAD + col * (PICK_CELL + 2 * PICK_PAD) + (PICK_CELL - dw) / 2;
+    let oy = PICK_PAD + row * (PICK_CELL + 2 * PICK_PAD) + (PICK_CELL - dh) / 2;
     for y in 0..dh {
         for x in 0..dw {
             let sx = x0 + x * sw / dw.max(1);
@@ -2595,7 +2609,6 @@ fn paste_scaled(
             }
         }
     }
-    let _ = ch;
 }
 
 fn write_rgb_png(path: &Path, w: usize, h: usize, rgb: &[u8]) -> Result<()> {
@@ -2692,5 +2705,24 @@ mod tests {
                 && !local.contains("%3F"),
             "{local}"
         );
+    }
+
+    #[test]
+    fn flags_ref_bar_with_four_characters() {
+        // 白底参考条上画几个 30 像素宽的黑块当字，块间隔 20 像素
+        let bar = |blocks: usize| {
+            image::RgbImage::from_fn(200, 30, |x, _| {
+                let x = x as usize;
+                let inked = x >= 10 && (x - 10) % 50 < 30 && (x - 10) / 50 < blocks;
+                image::Rgb(if inked { [0, 0, 0] } else { [255, 255, 255] })
+            })
+        };
+        let three = ref_segments(&bar(3), 1.0);
+        assert_eq!(three, [(10, 40), (60, 90), (110, 140)]);
+        assert_eq!(uneven_widths(&three), None);
+        // 4 个字会被并成 3 段，其中一段是两个字：段数看不出来，宽度看得出来
+        let four = ref_segments(&bar(4), 1.0);
+        assert_eq!(four.len(), 3, "{four:?}");
+        assert_eq!(uneven_widths(&four), Some((30, 80)), "{four:?}");
     }
 }

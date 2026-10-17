@@ -811,6 +811,11 @@ fn chrome_smoke() {
     assert_eq!(candidates.len(), 3, "应认出三个候选字：{picked}");
     assert_eq!(picked["refs"], 3, "参考条也要分出三个字：{picked}");
     assert!(montage.exists(), "对照图没写出来：{picked}");
+    assert_eq!(
+        picked["warnings"],
+        serde_json::json!([]),
+        "正常的三个字不该有警告：{picked}"
+    );
     for candidate in &candidates {
         let src = candidate["src"].as_array().unwrap();
         let cx = (src[0].as_f64().unwrap() + src[2].as_f64().unwrap()) / 2.0;
@@ -839,6 +844,8 @@ fn chrome_smoke() {
     assert!(!rejected.status.success(), "编号不存在时要直接报错");
     let rejected_err = String::from_utf8_lossy(&rejected.stderr);
     assert!(rejected_err.contains("C9"), "{rejected_err}");
+    let duplicated = run(&home, &["pick", "--click", "C1,C2,C2"]);
+    assert!(!duplicated.status.success(), "同一个编号写两次要直接报错");
     let after_reject = json(&home, &["eval", "document.title"]);
     assert_eq!(
         after_reject["result"].as_str(),
